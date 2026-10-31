@@ -1,0 +1,16 @@
+# 困难难度：高峰更猛、大桌更多、盘子紧张、顾客没耐心
+# 只列出与默认值不同的参数（其余见 core.py 的 RestaurantConfig）
+table_sizes: [2, 2, 2, 4, 4]
+party_size_probs: [0.1, 0.35, 0.2, 0.35]
+arrival_schedule:
+  - [0, 0.06]
+  - [50, 0.08]
+  - [80, 0.22]
+  - [160, 0.22]
+  - [190, 0.08]
+  - [240, 0.05]
+n_plates: 10
+initial_dirty_plates: 3
+patience_min: 18.0
+patience_max: 30.0
+dessert_prob: 0.35

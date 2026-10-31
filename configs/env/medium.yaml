@@ -1,0 +1,89 @@
+# 中等难度（主实验配置）
+# 这里列出全部参数方便修改；没写的参数使用 core.py 中 RestaurantConfig 的默认值。
+
+# ---- 回合 ----
+episode_length: 240          # 一回合步数，1 步 ≈ 1 分钟
+
+# ---- 桌子 ----
+table_sizes: [2, 2, 2, 4, 4] # 每张桌子的座位数：3 张两人桌 + 2 张四人桌
+
+# ---- 顾客到达 ----
+party_size_probs: [0.2, 0.4, 0.15, 0.25]  # 一组 1/2/3/4 人的概率
+arrival_rate: 0.08           # 仅在 arrival_schedule 为 null 时使用
+arrival_schedule:            # [步数, 到达率(组/步)]，中间线性插值
+  - [0, 0.05]
+  - [60, 0.06]
+  - [90, 0.16]               # 午餐高峰：90~150 步
+  - [150, 0.16]
+  - [180, 0.06]
+  - [240, 0.04]
+max_queue: 5                 # 门口排队上限（组），满了新顾客直接离开
+
+# ---- 耐心 ----
+patience_min: 25.0           # 初始耐心在 [min, max] 均匀采样（步）
+patience_max: 40.0
+patience_decay_queue: 1.0    # 排队时每步耐心减少量
+patience_decay_order: 1.0    # 入座等点单时
+patience_decay_food: 0.5     # 等上菜时
+dessert_patience: 15.0       # 进入甜点阶段时耐心重置为该值
+
+# ---- 用餐 ----
+eat_time_min: 8              # 主菜用餐时长（步）
+eat_time_max: 15
+dessert_prob: 0.25           # 吃完主菜后每人点甜点的概率
+dessert_eat_time_min: 3
+dessert_eat_time_max: 6
+
+# ---- 菜单 ----
+# category: main / dessert；weight: 同类之内被点到的相对概率
+dishes:
+  - {name: 沙拉,     category: main,    cook_time: 2,  price: 9.0,  weight: 1.0}
+  - {name: 例汤,     category: main,    cook_time: 2,  price: 7.0,  weight: 1.0}
+  - {name: 汉堡,     category: main,    cook_time: 4,  price: 14.0, weight: 1.5}
+  - {name: 意面,     category: main,    cook_time: 5,  price: 16.0, weight: 1.5}
+  - {name: 披萨,     category: main,    cook_time: 6,  price: 18.0, weight: 1.2}
+  - {name: 烤鸡,     category: main,    cook_time: 8,  price: 22.0, weight: 1.0}
+  - {name: 牛排,     category: main,    cook_time: 10, price: 28.0, weight: 0.8}
+  - {name: 海鲜饭,   category: main,    cook_time: 12, price: 32.0, weight: 0.5}
+  - {name: 冰淇淋,   category: dessert, cook_time: 1,  price: 6.0,  weight: 1.0}
+  - {name: 布朗尼,   category: dessert, cook_time: 2,  price: 8.0,  weight: 1.0}
+  - {name: 提拉米苏, category: dessert, cook_time: 3,  price: 9.0,  weight: 0.8}
+
+# ---- 厨房（共享瓶颈）----
+n_stoves: 3                  # 灶台数
+prep_time: 1                 # 开始做一道菜时厨师被占用的步数
+n_plates: 12                 # 盘子总数
+initial_dirty_plates: 0
+wash_time: 2                 # 洗一批的步数
+wash_batch: 4                # 一批最多洗几个
+pass_capacity: 6             # 出餐口容量（含灶台上预占的位置）
+cold_after: 3                # 在出餐口放超过 3 步，送到时算凉菜
+
+# ---- 服务员动作耗时（步）----
+seat_time: 1
+order_time: 1
+deliver_time: 1
+clear_time: 1
+
+# ---- 小费 ----
+tip_max_rate: 0.20           # 最高小费率
+tip_grace_wait: 10.0         # 等待 ≤ 10 步不打折
+tip_zero_wait: 60.0          # 等待达到 60 步小费为 0
+cold_tip_penalty: 0.5        # 全是凉菜时小费率减半
+
+# ---- 奖励（只写想改的项也可以）----
+reward:
+  revenue_scale: 0.05        # (账单 + 小费) × 0.05
+  walkaway_penalty: 0.5      # 每人
+  balk_penalty: 0.3          # 每人
+  dessert_abandon_penalty: 0.0
+  invalid_action_penalty: 0.0
+  step_penalty: 0.0
+  shaping:
+    enabled: true
+    seated: 0.1
+    order_taken: 0.1
+    dish_cooked: 0.02
+    dish_delivered: 0.05
+    plate_washed: 0.01
+    table_cleared: 0.1

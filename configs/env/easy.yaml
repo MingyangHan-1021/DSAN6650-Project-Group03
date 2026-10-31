@@ -1,0 +1,8 @@
+# 简单难度：无高峰、客流小、盘子充足，用于检查训练流程
+# 只列出与默认值不同的参数（其余见 core.py 的 RestaurantConfig）
+table_sizes: [2, 2, 2, 4, 4]
+arrival_schedule: null
+arrival_rate: 0.06
+n_plates: 16
+patience_min: 30.0
+patience_max: 45.0
