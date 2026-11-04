@@ -1,0 +1,4 @@
+gymnasium>=0.29
+numpy
+pyyaml
+pytest

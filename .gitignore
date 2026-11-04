@@ -4,3 +4,4 @@ __pycache__/
 runs/
 checkpoints/
 website-source/.quarto/
+results/logs/

@@ -1,15 +1,13 @@
 """
-中心化版本的 Gymnasium 接口：一个智能体同时控制厨师和服务员。
+Centralized Gymnasium interface: a single agent controls both the chef and the assistant.
 
-- 观测：整个餐厅的完整状态，拼成一个 0~1 之间的向量
-- 动作：MultiDiscrete([厨师动作数, 服务员动作数])
-- 奖励：团队奖励（见 rewards.py）
+- Observation: the full kitchen state as one vector with values in [0, 1]
+- Action: MultiDiscrete([S+1, S+1]) where S is the number of stations;
+  0 = wait, s+1 = go to station s and interact
+- Reward: the shared team reward (see rewards.py)
 
-可直接用于 Stable-Baselines3 的 PPO；
-提供 action_masks()，也可以配合 sb3-contrib 的 MaskablePPO 使用。
-
-观测维度与菜单长度无关（每桌只编码菜的数量和总做菜时间，不编码具体菜名），
-所以扩充或修改菜单不会改变网络输入大小。
+Provides action_masks() for use with sb3-contrib's MaskablePPO.
+The encode_* functions can be reused by the multi-agent version to build local observations.
 """
 
 from __future__ import annotations
@@ -20,111 +18,130 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from .core import N_TABLE_STATES, RestaurantConfig, RestaurantCore
+from .orders import arrival_rate_at
+from .core import C_BURNT, C_COOKING, C_DONE, C_FILLING, KitchenConfig, KitchenCore
+
+ITEM_SCALE = 3.0   # max copies of one component on a plate, used for normalization
 
 
-def encode_table(core: RestaurantCore, tb: dict) -> list:
-    """单张桌子的特征（17 维）。多智能体版本可以复用。"""
-    cfg, P = core.cfg, core.max_party
-    s = [0.0] * N_TABLE_STATES
-    s[tb["state"]] = 1.0
-    n = max(tb["n_items"], 1)
-    return s + [
-        tb["capacity"] / P,                                  # 桌子座位数
-        tb["party_size"] / P,                                # 这桌几个人
-        float(tb["phase"]),                                  # 是否在甜点阶段
-        tb["patience_frac"],                                 # 剩余耐心比例
-        tb["eat_remaining"] / cfg.eat_time_max,              # 用餐剩余时间
-        tb["n_pending"] / P,                                 # 待做的菜
-        tb["n_cooking"] / P,                                 # 在灶台上的菜
-        tb["n_ready"] / P,                                   # 在出餐口的菜
-        tb["n_delivered"] / n,                               # 已上菜比例
-        tb["pending_cook_time"] / (P * core.max_cook_time),  # 待做菜的总做菜时间
-        tb["max_pass_wait"] / (2 * max(cfg.cold_after, 1)),  # 出餐口上放得最久的菜（≥0.5 表示已凉）
-        tb["wait_so_far"] / cfg.tip_zero_wait,               # 已等待时间（影响小费）
+def encode_item(core: KitchenCore, it) -> list:
+    """One thing: [is food, is plate] + count of each component (C+2 values)."""
+    v = [0.0] * (len(core.book.vocab) + 2)
+    if it is None:
+        return v
+    idx = core.book.vocab_index
+    if it.kind == "food":
+        v[0] = 1.0
+        v[2 + idx[it.comp]] = 1.0 / ITEM_SCALE
+    else:
+        v[1] = 1.0
+        for c in it.contents:
+            v[2 + idx[c]] += 1.0 / ITEM_SCALE
+    return v
+
+
+def encode_agent(core: KitchenCore, a: int) -> list:
+    """One agent: position one-hot (S) + target one-hot (S) + [busy, walking, steps left] + item in hand."""
+    S = core.S
+    pos = [0.0] * S
+    pos[core.pos[a]] = 1.0
+    tgt = [0.0] * S
+    task = core.task[a]
+    if task is not None:
+        tgt[task.target] = 1.0
+    status = [
+        float(task is not None),
+        float(task is not None and not task.arrived),
+        0.0 if task is None else (task.travel + task.work) / 10.0,
     ]
+    return pos + tgt + status + encode_item(core, core.holding[a])
 
 
-def encode_state(core: RestaurantCore, state: dict) -> np.ndarray:
+def encode_station(core: KitchenCore, s: int) -> list:
+    """A counter or cooker: its contents (C+2) + cooker status one-hot (4) + progress (C+7 values in total)."""
+    kind = core.layout.kinds[s]
+    if kind == "counter":
+        return encode_item(core, core.counter[s]) + [0.0] * 5
+    c = core.cookers[s]
+    v = [0.0] * (len(core.book.vocab) + 2)
+    for x in c.contents:
+        v[2 + core.book.vocab_index[x]] += 1.0 / ITEM_SCALE
+    st = [float(c.status == k) for k in (C_FILLING, C_COOKING, C_DONE, C_BURNT)]
+    if c.status == C_COOKING:
+        prog = 1.0 - c.remaining / max(c.total, 1)
+    elif c.status == C_DONE:
+        prog = c.done_for / max(core.cfg.burn_after, 1)       # closer to 1 = about to burn
+    else:
+        prog = 0.0
+    return v + st + [prog]
+
+
+def encode_orders(core: KitchenCore) -> list:
+    """The K open orders with the earliest deadlines: [remaining count per dish (D), time left, time waited]."""
+    cfg, menu = core.cfg, core.book.menu
+    K, pmax = cfg.max_visible_orders, cfg.orders["patience_max"]
+    orders = sorted(core.open_orders, key=lambda o: o.deadline_t)[:K]
+    v = []
+    for j in range(K):
+        if j < len(orders):
+            o = orders[j]
+            v += [o.remaining[d] / ITEM_SCALE for d in menu]
+            v += [(o.deadline_t - core.t) / pmax, (core.t - o.arrival_t) / cfg.tip_zero_wait]
+        else:
+            v += [0.0] * (len(menu) + 2)
+    v.append(len(core.open_orders) / K)
+    return v
+
+
+def encode_state(core: KitchenCore) -> np.ndarray:
     cfg = core.cfg
     feats = []
-
-    # 每张桌子：17 维
-    for tb in state["tables"]:
-        feats += encode_table(core, tb)
-
-    # 门口排队：每个位置 [是否有人, 人数, 耐心比例]，共 3 × max_queue 维
-    for j in range(cfg.max_queue):
-        if j < len(state["queue"]):
-            g = state["queue"][j]
-            feats += [1.0, g["size"] / core.max_party, g["patience_frac"]]
-        else:
-            feats += [0.0, 0.0, 0.0]
-
-    # 厨房资源：4 维
+    for a in (0, 1):
+        feats += encode_agent(core, a)
+    for s in core.layout.stateful:
+        feats += encode_station(core, s)
     feats += [
-        state["clean_plates"] / cfg.n_plates,
-        state["dirty_plates"] / cfg.n_plates,
-        state["pass_count"] / cfg.pass_capacity,
-        len(state["stoves"]) / cfg.n_stoves,
+        core.clean_plates / cfg.n_plates,
+        core.sink_dirty / cfg.n_plates,
+        len(core.returning) / cfg.n_plates,
     ]
-
-    # 灶台：每个灶台的剩余时间，按剩余时间排序，共 n_stoves 维
-    rem = sorted(s["remaining"] for s in state["stoves"])
-    rem += [0] * (cfg.n_stoves - len(rem))
-    feats += [r / core.max_cook_time for r in rem]
-
-    # 厨师 / 服务员：3 维
-    max_srv = max(cfg.seat_time, cfg.order_time, cfg.deliver_time, cfg.clear_time)
-    feats += [
-        state["chef_busy"] / max(cfg.prep_time, cfg.wash_time),
-        float(state["chef_washing"]),
-        state["server_busy"] / max_srv,
-    ]
-
-    # 时间与客流：2 维
-    feats += [state["t"] / cfg.episode_length, state["arrival_rate"] / core.max_rate]
-
-    return np.asarray(feats, dtype=np.float32)
+    feats += encode_orders(core)
+    feats += [core.t / cfg.episode_length, arrival_rate_at(cfg.orders, core.t) / core.max_rate]
+    return np.clip(np.asarray(feats, dtype=np.float32), 0.0, 1.0)
 
 
-class CentralizedRestaurantEnv(gym.Env):
+class CentralizedKitchenEnv(gym.Env):
     metadata = {"render_modes": ["ansi", "human"]}
 
-    def __init__(self, config: Optional[RestaurantConfig] = None,
+    def __init__(self, config: Optional[KitchenConfig] = None,
                  config_path: Optional[str] = None, render_mode: Optional[str] = None):
         super().__init__()
         if config is None:
-            config = RestaurantConfig.from_yaml(config_path) if config_path else RestaurantConfig()
-        self.core = RestaurantCore(config)
+            config = KitchenConfig.from_yaml(config_path) if config_path else KitchenConfig()
+        self.core = KitchenCore(config)
         self.render_mode = render_mode
-
-        self.action_space = spaces.MultiDiscrete(
-            [self.core.n_chef_actions, self.core.n_server_actions]
-        )
-        obs_dim = encode_state(self.core, self.core.reset(seed=0)).shape[0]
-        self.observation_space = spaces.Box(0.0, 1.0, shape=(obs_dim,), dtype=np.float32)
+        n = self.core.n_actions
+        self.action_space = spaces.MultiDiscrete([n, n])
+        self.core.reset(seed=0)
+        dim = encode_state(self.core).shape[0]
+        self.observation_space = spaces.Box(0.0, 1.0, shape=(dim,), dtype=np.float32)
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
-        if seed is None:  # 由 gym 的 np_random 派生种子，保证 env.reset(seed) 后可复现
+        if seed is None:   # derive a seed from gym's np_random so runs are reproducible after env.reset(seed)
             seed = int(self.np_random.integers(0, 2**31 - 1))
-        state = self.core.reset(seed=seed)
-        return self._obs(state), self.core.summary()
+        self.core.reset(seed=seed)
+        return encode_state(self.core), self.core.summary()
 
     def step(self, action):
-        chef_a, server_a = int(action[0]), int(action[1])
-        state, reward, terminated, truncated, info = self.core.step(chef_a, server_a)
+        _, reward, terminated, truncated, info = self.core.step((int(action[0]), int(action[1])))
         if self.render_mode == "human":
             print(self.render())
-        return self._obs(state), reward, terminated, truncated, info
+        return encode_state(self.core), reward, terminated, truncated, info
 
     def action_masks(self) -> np.ndarray:
-        """MaskablePPO 要求：MultiDiscrete 的各维 mask 依次拼接。"""
-        return np.concatenate([self.core.chef_mask(), self.core.server_mask()])
+        """As MaskablePPO expects: the masks of each MultiDiscrete dimension, concatenated."""
+        return np.array(self.core.action_mask(0) + self.core.action_mask(1), dtype=bool)
 
     def render(self):
         return self.core.render_text()
-
-    def _obs(self, state: dict) -> np.ndarray:
-        return np.clip(encode_state(self.core, state), 0.0, 1.0)

@@ -1,0 +1,27 @@
+{
+  "name": "open",
+  "description": "Open kitchen: both agents can use every station.",
+  "stations": [
+    {"name": "lettuce_bin", "kind": "dispenser", "pos": [0, 0], "ingredient": "lettuce"},
+    {"name": "tomato_bin", "kind": "dispenser", "pos": [1, 0], "ingredient": "tomato"},
+    {"name": "beef_bin", "kind": "dispenser", "pos": [2, 0], "ingredient": "beef"},
+    {"name": "bun_bin", "kind": "dispenser", "pos": [3, 0], "ingredient": "bun"},
+    {"name": "noodle_bin", "kind": "dispenser", "pos": [4, 0], "ingredient": "noodles"},
+    {"name": "dough_bin", "kind": "dispenser", "pos": [5, 0], "ingredient": "dough"},
+    {"name": "cheese_bin", "kind": "dispenser", "pos": [6, 0], "ingredient": "cheese"},
+    {"name": "cutting_board", "kind": "cutting_board", "pos": [0, 2]},
+    {"name": "counter_a", "kind": "counter", "pos": [2, 2]},
+    {"name": "counter_b", "kind": "counter", "pos": [3, 2]},
+    {"name": "counter_c", "kind": "counter", "pos": [4, 2]},
+    {"name": "pan", "kind": "pan", "pos": [6, 2]},
+    {"name": "plate_rack", "kind": "plate_rack", "pos": [0, 4]},
+    {"name": "sink", "kind": "sink", "pos": [1, 4]},
+    {"name": "trash", "kind": "trash", "pos": [2, 4]},
+    {"name": "pass", "kind": "pass", "pos": [3, 4]},
+    {"name": "oven", "kind": "oven", "pos": [4, 4]},
+    {"name": "pot_1", "kind": "pot", "pos": [5, 4]},
+    {"name": "pot_2", "kind": "pot", "pos": [6, 4]}
+  ],
+  "agent_starts": ["counter_c", "counter_a"],
+  "zones": null
+}

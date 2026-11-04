@@ -1,8 +1,11 @@
-# 简单难度：无高峰、客流小、盘子充足，用于检查训练流程
-# 只列出与默认值不同的参数（其余见 core.py 的 RestaurantConfig）
-table_sizes: [2, 2, 2, 4, 4]
-arrival_schedule: null
-arrival_rate: 0.06
-n_plates: 16
-patience_min: 30.0
-patience_max: 45.0
+# Easy: 3 dishes, open kitchen, constant order rate, plenty of plates
+# Only parameters that differ from the defaults are listed (see KitchenConfig in core.py)
+menu: [salad, tomato_soup, burger]
+layout_file: data/layouts/open.json
+n_plates: 8
+orders:
+  arrival_rate: 0.025
+  arrival_schedule: null
+  dishes_per_order_probs: [0.8, 0.2]
+  patience_min: 120
+  patience_max: 160

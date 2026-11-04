@@ -1,15 +1,55 @@
-"""环境规则测试：在项目根目录运行 pytest tests"""
+"""Rule tests for the environment: run `pytest tests` from the project root."""
+import csv
+import json
+
 import numpy as np
 import pytest
 
-from restaurant_env.core import (
-    DIRTY, DISH_READY, EATING, EMPTY, PHASE_DESSERT, WAIT_FOOD, WAIT_ORDER,
-    Group, RestaurantConfig, RestaurantCore,
+from restaurant_env import (
+    CentralizedKitchenEnv, EpisodeLogger, KitchenConfig, KitchenCore,
+    generate_orders, load_orders_csv, save_orders_csv,
 )
-from restaurant_env.centralized_env import CentralizedRestaurantEnv
+from restaurant_env.core import C_BURNT, C_COOKING, C_DONE
+from restaurant_env.orders import Order
 
 CONFIGS = ["configs/env/easy.yaml", "configs/env/medium.yaml", "configs/env/hard.yaml"]
-ONE_DISH = [{"name": "x", "category": "main", "cook_time": 2, "price": 10.0}]
+ALL_DISHES = ["salad", "tomato_soup", "burger", "pasta", "pizza"]
+
+
+# ---------------------------------------------------------------- helpers
+def make_core(menu=ALL_DISHES, layout="data/layouts/open.json", orders=None, **kw):
+    cfg = KitchenConfig(menu=menu, layout_file=layout, **kw)
+    core = KitchenCore(cfg)
+    core.reset(0, orders=orders if orders is not None else [])
+    return core
+
+
+def order(oid, dishes, arrival=0, deadline=10_000):
+    return Order(oid, arrival, deadline, list(dishes))
+
+
+def do(core, a, station, expect_ok=True):
+    """Send agent a to a station while the other agent waits, until the action finishes.
+    Returns the number of steps it took."""
+    sid = core.layout.id[station]
+    acts = [0, 0]
+    acts[a] = sid + 1
+    assert core.action_mask(a)[sid + 1] == expect_ok, f"{core.agent_names[a]} @ {station}"
+    if not expect_ok:
+        return 0
+    failed = core.stats["failed"][a]
+    core.step(acts)
+    n = 1
+    while core.task[a] is not None:
+        core.step([0, 0])
+        n += 1
+    assert core.stats["failed"][a] == failed, f"{station} failed"
+    return n
+
+
+def wait(core, n):
+    for _ in range(n):
+        core.step([0, 0])
 
 
 def random_rollout(core, seed, use_mask=True):
@@ -18,197 +58,254 @@ def random_rollout(core, seed, use_mask=True):
     done = False
     while not done:
         if use_mask:
-            c = rng.choice(np.flatnonzero(core.chef_mask()))
-            s = rng.choice(np.flatnonzero(core.server_mask()))
+            acts = [rng.choice(np.flatnonzero(core.action_mask(a))) for a in (0, 1)]
         else:
-            c = rng.integers(core.n_chef_actions)
-            s = rng.integers(core.n_server_actions)
-        _, _, _, done, info = core.step(c, s)
+            acts = rng.integers(0, core.n_actions, size=2)
+        _, _, _, done, info = core.step(acts)
         yield core, info
 
 
-def quiet_core(**kw):
-    """没有随机到达的环境，便于手动构造场景。"""
-    base = dict(arrival_rate=0.0, arrival_schedule=None, patience_min=100, patience_max=100)
-    base.update(kw)
-    if max(base.get("table_sizes", [4])) < 4:   # 小桌场景：最多 2 人一组
-        base.setdefault("party_size_probs", [0.5, 0.5])
-    core = RestaurantCore(RestaurantConfig(**base))
-    core.reset(0)
-    return core
-
-
-def add_group(core, size, patience=100.0):
-    g = Group(core._next_gid, size, patience, patience, core.t)
-    core._next_gid += 1
-    core.queue.append(g)
-    return g
-
-
-# ---------------------------------------------------------------- 基本性质
+# ---------------------------------------------------------------- basic properties
 @pytest.mark.parametrize("path", CONFIGS)
 def test_configs_load(path):
-    RestaurantCore(RestaurantConfig.from_yaml(path)).reset(0)
+    KitchenCore(KitchenConfig.from_yaml(path)).reset(0)
 
 
 @pytest.mark.parametrize("path", CONFIGS)
 @pytest.mark.parametrize("use_mask", [True, False])
 def test_invariants(path, use_mask):
-    """盘子守恒、出餐口与灶台不超容量、桌上人数不超座位数"""
-    cfg = RestaurantConfig.from_yaml(path)
-    core = RestaurantCore(cfg)
-    for seed in range(3):
+    """Plates are conserved; the two agents never target the same station."""
+    cfg = KitchenConfig.from_yaml(path)
+    core = KitchenCore(cfg)
+    for seed in range(2):
         for c, _ in random_rollout(core, seed, use_mask):
-            assert c.clean_plates + c.dirty_plates + c.plates_in_use() == cfg.n_plates
-            assert c.clean_plates >= 0 and c.dirty_plates >= 0
-            assert c._pass_count() + len(c.stoves) <= cfg.pass_capacity
-            assert len(c.stoves) <= cfg.n_stoves
-            for tb in c.tables:
-                if tb.group is not None:
-                    assert tb.group.size <= tb.capacity
+            assert c.plates_total() == cfg.n_plates
+            assert c.clean_plates >= 0 and c.sink_dirty >= 0
+            if c.task[0] is not None and c.task[1] is not None:
+                assert c.task[0].target != c.task[1].target
 
 
 def test_masked_actions_never_invalid():
-    core = RestaurantCore(RestaurantConfig.from_yaml("configs/env/medium.yaml"))
-    *_, (_, info) = random_rollout(core, 0, use_mask=True)
-    assert info["invalid_chef"] == 0 and info["invalid_server"] == 0
+    core = KitchenCore(KitchenConfig.from_yaml("configs/env/medium.yaml"))
+    *_, (_, info) = random_rollout(core, 0)
+    assert info["a0_invalid"] == 0 and info["a1_invalid"] == 0
 
 
 def test_determinism():
-    core = RestaurantCore(RestaurantConfig.from_yaml("configs/env/medium.yaml"))
-    a = [i["revenue"] for _, i in random_rollout(core, 42)]
-    b = [i["revenue"] for _, i in random_rollout(core, 42)]
+    core = KitchenCore(KitchenConfig.from_yaml("configs/env/medium.yaml"))
+    a = [json.dumps(c.snapshot(), ensure_ascii=False) for c, _ in random_rollout(core, 7)]
+    b = [json.dumps(c.snapshot(), ensure_ascii=False) for c, _ in random_rollout(core, 7)]
     assert a == b
 
 
 def test_episode_length():
-    core = RestaurantCore(RestaurantConfig(episode_length=50))
-    assert sum(1 for _ in random_rollout(core, 0)) == 50
+    core = KitchenCore(KitchenConfig(episode_length=40))
+    assert sum(1 for _ in random_rollout(core, 0)) == 40
 
 
-# ---------------------------------------------------------------- 具体规则
-def test_arrival_schedule_interpolation():
-    core = RestaurantCore(RestaurantConfig(arrival_schedule=[[0, 0.0], [100, 0.2], [200, 0.2]]))
-    assert core.arrival_rate_at(0) == 0.0
-    assert core.arrival_rate_at(50) == pytest.approx(0.1)
-    assert core.arrival_rate_at(150) == pytest.approx(0.2)
-    assert core.arrival_rate_at(999) == pytest.approx(0.2)   # 超出范围保持端点值
+# ---------------------------------------------------------------- order CSV
+def test_orders_csv_roundtrip(tmp_path):
+    cfg = KitchenConfig.from_yaml("configs/env/medium.yaml")
+    orders = generate_orders(cfg.orders, cfg.menu, cfg.episode_length, seed=3)
+    path = tmp_path / "orders.csv"
+    save_orders_csv(orders, path)
+    loaded = load_orders_csv(path)
+    assert [(o.oid, o.arrival_t, o.deadline_t, o.dishes) for o in orders] == \
+           [(o.oid, o.arrival_t, o.deadline_t, o.dishes) for o in loaded]
 
 
-def test_big_group_cannot_sit_at_small_table():
-    core = quiet_core(table_sizes=[2, 4])
-    add_group(core, 4)
-    m = core.server_mask()
-    assert not m[1]      # 0 号桌只有 2 座
-    assert m[2]          # 1 号桌 4 座
+def test_orders_file_used(tmp_path):
+    path = tmp_path / "orders.csv"
+    save_orders_csv([order(0, ["salad"], arrival=0, deadline=50)], path)
+    core = KitchenCore(KitchenConfig(orders={"orders_file": str(path)}))
+    core.reset(123)
+    assert [o.oid for o in core.open_orders] == [0]
 
 
-def test_seat_picks_first_group_that_fits():
-    core = quiet_core(table_sizes=[2, 4])
-    add_group(core, 4)
-    small = add_group(core, 2)
-    core.step(0, 1)      # 带位到 2 人桌：跳过排在前面的 4 人组
-    assert core.tables[0].group is small and len(core.queue) == 1
+# ---------------------------------------------------------------- every dish can be made
+def test_salad():
+    core = make_core(orders=[order(0, ["salad"])])
+    for st in ["lettuce_bin", "cutting_board", "counter_b", "tomato_bin", "cutting_board", "counter_c", "plate_rack", "counter_b", "counter_c", "pass"]:
+        do(core, 1, st)
+    assert core.stats["orders_completed"] == 1 and core.stats["bill_total"] == 10
 
 
-def test_cannot_cook_without_clean_plate():
-    core = quiet_core(table_sizes=[2], n_plates=1, initial_dirty_plates=1, dishes=ONE_DISH)
-    add_group(core, 1)
-    core.step(0, 1); core.step(0, 2)       # 带位、点单
-    assert core.tables[0].state == WAIT_FOOD
-    assert not core.chef_mask()[1]
-    core.step(1, 0)
-    assert core.stats["invalid_chef"] == 1
+def test_tomato_soup_and_burn():
+    core = make_core(orders=[order(0, ["tomato_soup"])], burn_after=3)
+    for _ in range(2):
+        do(core, 1, "tomato_bin"); do(core, 1, "cutting_board"); do(core, 1, "pot_1")
+    pot = core.cookers[core.layout.id["pot_1"]]
+    assert pot.status == C_COOKING
+    do(core, 1, "plate_rack")                       # grab a plate first and wait
+    while pot.status != C_DONE:
+        wait(core, 1)
+    do(core, 1, "pot_1"); do(core, 1, "pass")
+    assert core.stats["orders_completed"] == 1
+    # cook another pot and leave it: it burns
+    for _ in range(2):
+        do(core, 1, "tomato_bin"); do(core, 1, "cutting_board"); do(core, 1, "pot_1")
+    wait(core, 6 + 4)
+    pot = core.cookers[core.layout.id["pot_1"]]
+    assert pot.status == C_BURNT and core.stats["burnt"] == 1
+    do(core, 0, "pot_1")                        # clean it with empty hands
+    assert core.cookers[core.layout.id["pot_1"]].contents == []
 
 
-def test_customer_walks_away_when_patience_runs_out():
-    core = quiet_core()
-    add_group(core, 3, patience=3)
-    for _ in range(3):
-        core.step(0, 0)
-    assert core.stats["walkaway_queue_groups"] == 1 and core.stats["walkaway_people"] == 3
+def test_burger_with_handoff():
+    """Assistant chops lettuce onto a counter; chef fries beef, takes a plate, adds the bun,
+    picks up the lettuce and serves."""
+    core = make_core(orders=[order(0, ["burger"])])
+    do(core, 1, "lettuce_bin"); do(core, 1, "cutting_board"); do(core, 1, "counter_b")
+    do(core, 0, "beef_bin"); do(core, 0, "pan"); do(core, 0, "counter_a")
+    do(core, 0, "plate_rack"); do(core, 0, "bun_bin"); do(core, 0, "counter_a")
+    do(core, 0, "counter_b"); do(core, 0, "pass")
+    assert core.stats["orders_completed"] == 1 and core.stats["handoffs"] == 1
 
 
-def test_tip_rate_formula():
-    core = quiet_core()
-    assert core.tip_rate(5, 0.0) == pytest.approx(0.20)    # 宽限期内
-    assert core.tip_rate(35, 0.0) == pytest.approx(0.10)   # 10 → 60 的中点
-    assert core.tip_rate(80, 0.0) == pytest.approx(0.0)
-    assert core.tip_rate(5, 1.0) == pytest.approx(0.10)    # 全凉菜减半
+def test_pasta():
+    core = make_core(orders=[order(0, ["pasta"])])
+    do(core, 1, "tomato_bin"); do(core, 1, "cutting_board"); do(core, 1, "pan"); do(core, 1, "counter_b")
+    do(core, 0, "noodle_bin"); do(core, 0, "pot_2"); do(core, 0, "plate_rack")
+    wait(core, 5)
+    do(core, 0, "pot_2"); do(core, 0, "counter_b"); do(core, 0, "pass")
+    assert core.stats["orders_completed"] == 1
 
 
-def test_cold_dish_counted():
-    core = quiet_core(table_sizes=[2], dishes=ONE_DISH, cold_after=2,
-                      dessert_prob=0.0, eat_time_min=2, eat_time_max=2)
-    add_group(core, 1)
-    core.step(0, 1); core.step(0, 2)        # 带位、点单
-    core.step(1, 0); core.step(0, 0)        # 做菜 2 步 → 出餐口
-    for _ in range(3):                      # 在出餐口放 3 步
-        core.step(0, 0)
-    core.step(0, 3)                         # 上菜
-    assert core.stats["cold_dishes"] == 1
+def test_pizza():
+    core = make_core(orders=[order(0, ["pizza"])])
+    do(core, 1, "dough_bin"); do(core, 1, "oven")
+    do(core, 1, "tomato_bin"); do(core, 1, "cutting_board"); do(core, 1, "oven")
+    do(core, 1, "cheese_bin"); do(core, 1, "cutting_board"); do(core, 1, "oven")
+    wait(core, 8)
+    do(core, 1, "plate_rack"); do(core, 1, "oven"); do(core, 1, "pass")
+    assert core.stats["orders_completed"] == 1
 
 
-def test_full_service_cycle_with_dessert():
-    """完整流程：带位 → 点主菜 → 做 → 上 → 吃 → 点甜点 → 做 → 上 → 吃 → 付款 → 清桌 → 洗碗"""
-    dishes = ONE_DISH + [{"name": "d", "category": "dessert", "cook_time": 1, "price": 5.0}]
-    core = quiet_core(table_sizes=[2], dishes=dishes, dessert_prob=1.0,
-                      eat_time_min=2, eat_time_max=2, dessert_eat_time_min=2, dessert_eat_time_max=2,
-                      n_plates=8)
-    add_group(core, 2)
-    N = core.N
-    core.step(0, 1)                                # 带位
-    core.step(0, 1 + N)                            # 点主菜（2 道）
-    assert len(core.tables[0].items) == 2
-    core.step(1, 0); core.step(1, 0)               # 两道菜分别上灶
-    core.step(0, 0)
-    assert all(it.status == DISH_READY for it in core.tables[0].items)
-    core.step(0, 1 + 2 * N)                        # 上菜
-    assert core.tables[0].state == EATING and core.tables[0].plates == 2
-    core.step(0, 0)                                # 吃完 → 进入甜点阶段
-    tb = core.tables[0]
-    assert tb.state == WAIT_ORDER and tb.phase == PHASE_DESSERT
-    core.step(0, 1 + N)                            # 点甜点（每人一份）
-    core.step(1, 0); core.step(1, 0)
-    core.step(0, 1 + 2 * N)                        # 上甜点
-    assert tb.state == EATING
-    core.step(0, 0)                                # 吃完付款
-    assert tb.state == DIRTY and tb.plates == 4
-    assert core.stats["bill_total"] == 30.0 and core.stats["tip_total"] > 0
-    core.step(0, 1 + 3 * N)                        # 清桌：4 个盘子进洗碗池
-    assert tb.state == EMPTY and core.dirty_plates == 4
-    core.step(N + 1, 0); core.step(0, 0)           # 洗一批（4 个，2 步）
-    assert core.dirty_plates == 0 and core.clean_plates == 8
+def test_multi_dish_order_tip_only_when_complete():
+    core = make_core(orders=[order(0, ["salad", "salad"])])
+    for _ in range(2):
+        for st in ["lettuce_bin", "cutting_board", "counter_b", "tomato_bin", "cutting_board", "counter_c", "plate_rack", "counter_b", "counter_c", "pass"]:
+            do(core, 1, st)
+        if core.stats["dishes_delivered"] == 1:
+            assert core.stats["tip_total"] == 0 and core.stats["orders_completed"] == 0
+    assert core.stats["orders_completed"] == 1 and core.stats["tip_total"] > 0
 
 
-def test_dessert_abandon_still_pays_main():
-    dishes = ONE_DISH + [{"name": "d", "category": "dessert", "cook_time": 1, "price": 5.0}]
-    core = quiet_core(table_sizes=[2], dishes=dishes, dessert_prob=1.0, dessert_patience=2,
-                      eat_time_min=1, eat_time_max=1)
-    add_group(core, 1)
-    N = core.N
-    core.step(0, 1); core.step(0, 1 + N)
-    core.step(1, 0); core.step(0, 0)
-    core.step(0, 1 + 2 * N)
-    core.step(0, 0)                                # 吃完，进入甜点阶段
-    assert core.tables[0].phase == PHASE_DESSERT
-    for _ in range(3):                             # 不理他们，耐心耗尽
-        core.step(0, 0)
-    assert core.stats["dessert_abandoned"] == 1
-    assert core.stats["bill_total"] == 10.0        # 主菜照付
-    assert core.tables[0].state == DIRTY
+# ---------------------------------------------------------------- specific rules
+def test_cannot_deliver_unordered_dish():
+    core = make_core(orders=[order(0, ["burger"])])
+    for st in ["lettuce_bin", "cutting_board", "counter_b", "tomato_bin", "cutting_board", "counter_c", "plate_rack", "counter_b", "counter_c"]:
+        do(core, 1, st)
+    do(core, 1, "pass", expect_ok=False)      # a salad is ready but nobody ordered one
 
 
+def test_wrong_ingredient_not_allowed_on_plate():
+    core = make_core()
+    do(core, 1, "plate_rack")
+    do(core, 1, "lettuce_bin", expect_ok=False)      # raw lettuce is not part of any dish
+    do(core, 1, "bun_bin")                       # the bun can go straight onto the plate (burger)
+
+
+def test_station_exclusive():
+    """A station the other agent is walking to or using cannot be chosen; it is released when the action ends."""
+    core = make_core()
+    tomato = core.layout.id["tomato_bin"] + 1
+    core.step([tomato, 0])
+    assert not core.action_mask(1)[tomato]
+    while core.task[0] is not None:
+        core.step([0, 0])
+    assert core.action_mask(1)[tomato]
+
+
+def test_simultaneous_choice_second_is_invalid():
+    core = make_core()
+    s = core.layout.id["tomato_bin"] + 1
+    core.step([s, s])
+    assert core.stats["invalid"] == [0, 0] and core.stats["conflicts"] == 1
+
+
+def test_order_expires():
+    core = make_core(orders=[order(0, ["salad"], arrival=0, deadline=5)])
+    wait(core, 5)
+    assert core.stats["orders_expired"] == 1 and core.open_orders == []
+
+
+def test_tip_rate():
+    core = make_core()
+    assert core.tip_rate(10) == pytest.approx(0.20)
+    assert core.tip_rate(65) == pytest.approx(0.10)    # midpoint of 30 -> 100
+    assert core.tip_rate(200) == 0.0
+
+
+def test_dirty_plate_returns_and_wash():
+    core = make_core(orders=[order(0, ["tomato_soup"])], dirty_return_delay=3)
+    for _ in range(2):
+        do(core, 1, "tomato_bin"); do(core, 1, "cutting_board"); do(core, 1, "pot_1")
+    do(core, 1, "plate_rack")
+    wait(core, 6)
+    do(core, 1, "pot_1"); do(core, 1, "pass")
+    wait(core, 3)
+    assert core.sink_dirty == 1
+    clean = core.clean_plates
+    do(core, 1, "sink")
+    assert core.clean_plates == clean + 1 and core.sink_dirty == 0
+
+
+def test_skill_times_differ():
+    core = make_core()
+    do(core, 0, "tomato_bin")
+    t_chef = do(core, 0, "cutting_board")
+    do(core, 0, "counter_a")
+    do(core, 1, "tomato_bin")
+    t_commis = do(core, 1, "cutting_board")
+    # both walk from the tomato bin to the cutting board: same travel time,
+    # the only difference is the chop skill (3 vs 2)
+    assert t_chef - t_commis == 1
+
+
+def test_split_layout_zones():
+    core = make_core(layout="data/layouts/split.json")
+    chef, commis = 0, 1
+    assert not core.action_mask(chef)[core.layout.id["tomato_bin"] + 1]
+    assert not core.action_mask(chef)[core.layout.id["plate_rack"] + 1]
+    assert not core.action_mask(commis)[core.layout.id["pass"] + 1]
+    do(core, commis, "plate_rack"); do(core, commis, "counter_b")
+    do(core, chef, "counter_b")                     # the plate can only reach the chef through a counter
+    assert core.stats["handoffs"] == 1
+
+
+def test_trash_penalized():
+    core = make_core()
+    do(core, 1, "tomato_bin")
+    _, r, _, _, _ = core.step([0, core.layout.id["trash"] + 1])
+    while core.task[1] is not None:
+        _, r, _, _, _ = core.step([0, 0])
+    assert core.stats["wasted"] == 1 and r < 0
+
+
+# ---------------------------------------------------------------- API and logging
 def test_gym_api():
     from gymnasium.utils.env_checker import check_env
-    env = CentralizedRestaurantEnv(config_path="configs/env/medium.yaml")
+    env = CentralizedKitchenEnv(config_path="configs/env/medium.yaml")
     check_env(env, skip_render_check=True)
     obs, _ = env.reset(seed=0)
     assert env.observation_space.contains(obs)
     assert env.action_masks().shape[0] == sum(env.action_space.nvec)
 
 
-def test_obs_dim_independent_of_menu():
-    a = CentralizedRestaurantEnv(RestaurantConfig())
-    b = CentralizedRestaurantEnv(RestaurantConfig(dishes=ONE_DISH))
-    assert a.observation_space.shape == b.observation_space.shape
+def test_logger(tmp_path):
+    core = KitchenCore(KitchenConfig.from_yaml("configs/env/easy.yaml"))
+    rng = np.random.default_rng(0)
+    core.reset(0)
+    log = EpisodeLogger(core)
+    done = False
+    while not done:
+        acts = [rng.choice(np.flatnonzero(core.action_mask(a))) for a in (0, 1)]
+        _, r, _, done, info = core.step(acts)
+        log.record(acts, r, info)
+    log.save(tmp_path)
+    with open(tmp_path / "actions.csv", encoding="utf-8") as f:
+        assert len(list(csv.DictReader(f))) == core.cfg.episode_length
+    with open(tmp_path / "frames.jsonl", encoding="utf-8") as f:
+        assert len(f.readlines()) == core.cfg.episode_length + 1
+    assert (tmp_path / "events.csv").exists() and (tmp_path / "summary.json").exists()

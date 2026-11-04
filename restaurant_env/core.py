@@ -1,861 +1,763 @@
 """
-餐厅环境的底层逻辑（与 Gym / PettingZoo 接口无关）。
+Core simulation of the cooperative kitchen (independent of the Gym / PettingZoo API).
 
-中心化版本（centralized_env.py）和多智能体版本（marl_env.py）都调用这里，
-保证两种设定下的规则完全一致，对比才公平。
+Two agents (agent 0 = chef, agent 1 = assistant by default) share one kitchen and work
+together to fill orders:
+take ingredients -> chop / fry / boil / bake -> plate -> hand in at the pass.
 
-基本设定
---------
-- 时间离散：1 步 ≈ 1 分钟。
-- 两个角色：
-    厨师（chef）：在灶台上做菜、洗盘子
-    服务员（server）：带位、点单、上菜、清桌
-- 顾客以"组"为单位到达，每组 1~4 人；桌子有不同大小（如两人桌、四人桌），
-  一组顾客只能坐进容量足够的桌子。
-- 每人点一道主菜；吃完主菜后，每人有一定概率追加甜点。
-- 菜单分主菜和甜点，做菜时间和价格不同。
-
-顾客流程
---------
-到达排队 → 带位 → 点主菜 → 厨师做菜 → 出餐口 → 上菜（主菜上齐才开始吃）→ 用餐
-  → [可能] 追加甜点：点甜点 → 做 → 上 → 吃
-  → 付款（账单 + 小费）离开 → 桌子变脏 → 清桌 → 脏盘子进洗碗池 → 厨师洗碗
-
-共享瓶颈
---------
-- 干净盘子：每道菜开始做时占用一个干净盘子；盘子一直留在桌上，清桌时才送回洗碗池。
-- 出餐口：做好的菜放在这里，容量有限。正在灶台上做的菜也预占出餐口位置，
-  所以"出餐口上的菜 + 灶台上的菜"不能超过出餐口容量。
-- 灶台：同时最多做 n_stoves 道菜。
-
-小费与满意度
-------------
-小费 = 账单 × 小费率
-小费率 = tip_max_rate × 等待系数 × (1 - cold_tip_penalty × 凉菜比例)
-- 等待时间 = 到达 → 主菜上齐，若吃了甜点再加上 甜点阶段开始 → 甜点上齐
-- 等待系数：等待 ≤ tip_grace_wait 时为 1，之后线性下降，到 tip_zero_wait 时为 0
-- 凉菜：在出餐口放了超过 cold_after 步才被送到桌上的菜
-
-动作的时间语义
+Rules vs. data
 --------------
-- 服务员动作：选择后立即生效，然后锁定若干步（模拟耗时）。
-- 厨师开始做菜：只锁定 prep_time 步（备菜），之后菜在灶台上自己计时，
-  厨师可以去做别的事（开始另一道菜或洗碗）。
-- 厨师洗碗：一次洗最多 wash_batch 个，锁定 wash_time 步，完成时盘子变干净。
-- 被锁定的智能体只能选 0（继续），其他动作会被忽略，且不算非法。
+- data/recipes.json        recipes: ingredients, processes, cooker recipes, dishes
+- data/layouts/*.json      kitchen layout: stations, coordinates, start positions, zones
+- configs/env/*.yaml       everything else: menu, skills, plates, order stream, tips, reward
+- order CSV (optional)     a pre-generated order stream
+- this file                only advances the state: (state, action) -> new state
 
-每步结算顺序
-------------
-1. 厨师动作  2. 服务员动作  3. 灶台计时（做好的菜进出餐口）与厨师锁定计时
-4. 服务员锁定计时  5. 出餐口上的菜放凉计时  6. 用餐计时（吃完 → 甜点或付款）
-7. 耐心衰减与顾客离开  8. 新顾客到达  9. 时间 +1
+Actions
+-------
+Each agent picks one action per step: 0 = wait; s+1 = walk to station s and interact with it.
+What "interact" means depends on what the agent is holding and on the station's state
+(the same idea as Overcooked's interact).
+An action takes (travel time + interaction time) steps; meanwhile the agent is locked and
+can only choose 0.
+
+- An agent holds at most one thing: one food item, or one plate (a plate can hold several items).
+- A station can be used by only one agent at a time: while the other agent is walking to it
+  or working at it, you cannot choose it. (After an action finishes, the agent stays where
+  it is but no longer occupies that station.)
+- On arrival the interaction is checked again (e.g. the item on a counter may be gone);
+  if it no longer applies, the action "fails".
+
+Order of updates in each step
+-----------------------------
+1. Agents 0 and 1 choose new actions in turn (agent 1 already sees what agent 0 just claimed)
+2. Each agent's action advances one step (travel / arrive / work / finish)
+3. Cookers tick (done, burnt)
+4. Dirty plates return to the sink
+5. Late orders expire, new orders arrive
+6. Time +1, reward is computed
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
-import numpy as np
 import yaml
 
+from .layout import Layout
+from .orders import arrival_rate_at, generate_orders, load_orders_csv
+from .recipes import RecipeBook
 from .rewards import compute_reward
 
-# ---------------------------------------------------------------------------
-# 常量
-# ---------------------------------------------------------------------------
-# 桌子状态
-EMPTY = 0       # 空桌，可以带位
-WAIT_ORDER = 1  # 已入座，等待点单（主菜或甜点）
-WAIT_FOOD = 2   # 已点单，菜还没上齐
-EATING = 3      # 用餐中
-DIRTY = 4       # 顾客已离开，桌上有脏盘子，需要清理
-TABLE_STATE_NAMES = ["空桌", "等点单", "等上菜", "用餐中", "待清理"]
-N_TABLE_STATES = 5
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 用餐阶段
-PHASE_MAIN = 0
-PHASE_DESSERT = 1
-
-# 单道菜的状态
-DISH_PENDING = 0    # 已下单，还没开始做
-DISH_COOKING = 1    # 在灶台上
-DISH_READY = 2      # 在出餐口
-DISH_DELIVERED = 3  # 已送到桌上
+# Cooker states
+C_EMPTY, C_FILLING, C_COOKING, C_DONE, C_BURNT = 0, 1, 2, 3, 4
+COOKER_STATE_NAMES = ["empty", "filling", "cooking", "done", "burnt"]
 
 
 # ---------------------------------------------------------------------------
-# 配置默认值
+# Configuration
 # ---------------------------------------------------------------------------
-def _default_dishes():
-    # category: main 主菜 / dessert 甜点；weight: 被点到的相对概率（同类之内）
+def _default_agents():
+    # skills: number of steps each job takes; null means the agent cannot do it
     return [
-        {"name": "沙拉",     "category": "main",    "cook_time": 2,  "price": 9.0,  "weight": 1.0},
-        {"name": "例汤",     "category": "main",    "cook_time": 2,  "price": 7.0,  "weight": 1.0},
-        {"name": "汉堡",     "category": "main",    "cook_time": 4,  "price": 14.0, "weight": 1.5},
-        {"name": "意面",     "category": "main",    "cook_time": 5,  "price": 16.0, "weight": 1.5},
-        {"name": "披萨",     "category": "main",    "cook_time": 6,  "price": 18.0, "weight": 1.2},
-        {"name": "烤鸡",     "category": "main",    "cook_time": 8,  "price": 22.0, "weight": 1.0},
-        {"name": "牛排",     "category": "main",    "cook_time": 10, "price": 28.0, "weight": 0.8},
-        {"name": "海鲜饭",   "category": "main",    "cook_time": 12, "price": 32.0, "weight": 0.5},
-        {"name": "冰淇淋",   "category": "dessert", "cook_time": 1,  "price": 6.0,  "weight": 1.0},
-        {"name": "布朗尼",   "category": "dessert", "cook_time": 2,  "price": 8.0,  "weight": 1.0},
-        {"name": "提拉米苏", "category": "dessert", "cook_time": 3,  "price": 9.0,  "weight": 0.8},
+        {"name": "chef", "move_speed": 2.0, "skills": {"chop": 3, "fry": 2, "wash": 3}},
+        {"name": "assistant", "move_speed": 2.0, "skills": {"chop": 2, "fry": 4, "wash": 2}},
     ]
+
+
+def _default_orders():
+    return {
+        "orders_file": None,          # path to an order CSV; null = generate from the seed
+        "arrival_rate": 0.03,         # constant rate (orders/step), used when arrival_schedule is null
+        "arrival_schedule": None,     # [[step, rate], ...], piecewise-linear interpolation
+        "dishes_per_order_probs": [0.7, 0.3],  # probability of 1 / 2 / ... dishes per order
+        "dish_weights": None,         # {dish: weight}; null = uniform
+        "patience_min": 100,          # steps from arrival until the order expires
+        "patience_max": 140,
+    }
 
 
 def _default_reward():
     return {
-        "revenue_scale": 0.05,          # (账单 + 小费) × 系数 = 奖励
-        "walkaway_penalty": 0.5,        # 主菜阶段耐心耗尽离开，每人惩罚
-        "balk_penalty": 0.3,            # 门口排满直接离开，每人惩罚
-        "dessert_abandon_penalty": 0.0,  # 甜点阶段等不及离开（主菜照付），每组惩罚
-        "invalid_action_penalty": 0.0,  # 每个非法动作的惩罚
-        "step_penalty": 0.0,            # 每步固定惩罚
-        "shaping": {                    # 中间奖励（奖励塑形），可整体关闭做消融
+        "revenue_scale": 0.1,         # (price + tip) x scale
+        "expire_penalty": 1.0,        # per expired order
+        "burn_penalty": 0.5,          # per burnt cooker
+        "waste_penalty": 0.1,         # per food item thrown away
+        "invalid_action_penalty": 0.0,  # chose an action that is not currently allowed
+        "failed_action_penalty": 0.0,   # arrived but the interaction no longer applies
+        "step_penalty": 0.0,
+        "shaping": {
             "enabled": True,
-            "seated": 0.1,              # 每次带位
-            "order_taken": 0.1,         # 每次点单（主菜或甜点）
-            "dish_cooked": 0.02,        # 每道菜做好
-            "dish_delivered": 0.05,     # 每道菜送到桌上
-            "plate_washed": 0.01,       # 每洗好一个盘子
-            "table_cleared": 0.1,       # 每次清桌
+            "chop": 0.05,             # per item chopped
+            "fry": 0.05,              # per item fried
+            "cooker_start": 0.1,      # a cooker has all its inputs and starts cooking
+            "cooker_collect": 0.1,    # finished soup / pizza / etc. moved onto a plate
+            "plate_add": 0.05,        # per item added to a plate (not counting cooker_collect)
+            "dish_delivered": 0.3,    # per dish handed in
         },
     }
 
 
 @dataclass
-class RestaurantConfig:
-    # ---- 回合 ----
-    episode_length: int = 240           # 一回合多少步（240 步 ≈ 4 小时）
+class KitchenConfig:
+    episode_length: int = 300
+    recipes_file: str = "data/recipes.json"
+    layout_file: str = "data/layouts/open.json"
+    menu: list = field(default_factory=lambda: ["salad", "tomato_soup", "burger"])
+    agents: list = field(default_factory=_default_agents)
 
-    # ---- 桌子 ----
-    table_sizes: list = field(default_factory=lambda: [2, 2, 4, 4])  # 每张桌子的座位数
+    # Plates
+    n_plates: int = 6
+    initial_dirty_plates: int = 0
+    dirty_return_delay: int = 5       # steps after a dish is served until its plate reaches the sink
 
-    # ---- 顾客到达 ----
-    party_size_probs: list = field(default_factory=lambda: [0.2, 0.4, 0.15, 0.25])
-    # 一组人数为 1,2,3,4 的概率（列表长度即最大人数）
-    arrival_rate: float = 0.08          # arrival_schedule 为 null 时使用的固定到达率（组/步）
-    arrival_schedule: Optional[list] = None
-    # 时变到达率：[[步数, 到达率], ...]，中间线性插值，两端外保持不变
-    # 例：[[0, 0.05], [60, 0.05], [90, 0.18], [150, 0.18], [180, 0.05]] 表示午餐高峰
-    max_queue: int = 5                  # 门口最多排几组，满了新顾客直接离开（balk）
+    # Cookers
+    burn_after: int = 8               # steps a finished cooker can wait before it burns
+    cooker_clean_time: int = 2        # steps needed to clean a burnt cooker
 
-    # ---- 耐心 ----
-    patience_min: float = 25.0          # 初始耐心在 [min, max] 均匀采样，单位：步
-    patience_max: float = 40.0
-    patience_decay_queue: float = 1.0   # 门口排队时每步耐心减少量
-    patience_decay_order: float = 1.0   # 入座等点单时
-    patience_decay_food: float = 0.5    # 点单后等上菜时
-    dessert_patience: float = 15.0      # 进入甜点阶段时耐心重置为这个值
+    # Orders and tips
+    orders: dict = field(default_factory=_default_orders)
+    max_visible_orders: int = 5       # how many of the earliest open orders appear in the observation
+    tip_max_rate: float = 0.20
+    tip_grace_wait: float = 30.0      # no tip reduction if the order is finished within this many steps
+    tip_zero_wait: float = 100.0      # tip drops to 0 at this many steps
 
-    # ---- 用餐 ----
-    eat_time_min: int = 8               # 主菜用餐时长（步）
-    eat_time_max: int = 15
-    dessert_prob: float = 0.25          # 吃完主菜后，每人点甜点的概率
-    dessert_eat_time_min: int = 3       # 甜点用餐时长（步）
-    dessert_eat_time_max: int = 6
-
-    # ---- 菜单 ----
-    dishes: list = field(default_factory=_default_dishes)
-
-    # ---- 厨房 ----
-    n_stoves: int = 3                   # 灶台数：同时最多做几道菜
-    prep_time: int = 1                  # 开始做一道菜时厨师被占用的步数
-    n_plates: int = 16                  # 盘子总数
-    initial_dirty_plates: int = 0       # 开局时脏盘子数
-    wash_time: int = 2                  # 洗一批盘子需要几步
-    wash_batch: int = 4                 # 一批最多洗几个
-    pass_capacity: int = 6              # 出餐口容量（含灶台上预占的位置）
-    cold_after: int = 3                 # 菜在出餐口放超过这么多步，送到时算凉菜
-
-    # ---- 服务员动作耗时（步）----
-    seat_time: int = 1
-    order_time: int = 1
-    deliver_time: int = 1
-    clear_time: int = 1
-
-    # ---- 小费 ----
-    tip_max_rate: float = 0.20          # 最高小费率
-    tip_grace_wait: float = 10.0        # 等待不超过这么多步，小费率不打折
-    tip_zero_wait: float = 60.0         # 等待达到这么多步，小费率降为 0
-    cold_tip_penalty: float = 0.5       # 全部是凉菜时，小费率再打几折（0.5 = 减半）
-
-    # ---- 奖励 ----
     reward: dict = field(default_factory=_default_reward)
 
-    # ------------------------------------------------------------------
     @classmethod
-    def from_yaml(cls, path: str) -> "RestaurantConfig":
+    def from_yaml(cls, path: str) -> "KitchenConfig":
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         return cls.from_dict(data)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "RestaurantConfig":
-        data = dict(data)
-        # 奖励部分做深合并：YAML 里只写想改的项即可
-        reward = _default_reward()
-        user_reward = dict(data.pop("reward", {}) or {})
-        user_shaping = user_reward.pop("shaping", {}) or {}
-        reward.update(user_reward)
-        reward["shaping"].update(user_shaping)
-        cfg = cls(**data, reward=reward)
-        cfg.validate()
-        return cfg
+    def from_dict(cls, data: dict) -> "KitchenConfig":
+        return cls(**data)
 
     def __post_init__(self):
-        self.validate()
-
-    def validate(self):
-        max_party = len(self.party_size_probs)
-        assert len(self.table_sizes) >= 1
-        assert max(self.table_sizes) >= max_party, "至少要有一张桌子能坐下最大的一组"
-        assert abs(sum(self.party_size_probs) - 1.0) < 1e-6
+        # Deep-merge orders / reward with the defaults, so a YAML file only lists what it changes
+        orders = _default_orders()
+        orders.update(self.orders or {})
+        self.orders = orders
+        reward = _default_reward()
+        user = dict(self.reward or {})
+        reward["shaping"].update(user.pop("shaping", {}) or {})
+        reward.update(user)
+        self.reward = reward
+        assert len(self.agents) == 2, "only two agents are supported"
         assert 0 <= self.initial_dirty_plates <= self.n_plates
-        assert self.patience_min <= self.patience_max
-        assert self.eat_time_min <= self.eat_time_max
-        assert self.dessert_eat_time_min <= self.dessert_eat_time_max
-        assert 0.0 <= self.dessert_prob <= 1.0
         assert self.tip_grace_wait < self.tip_zero_wait
-        assert self.n_stoves >= 1 and self.prep_time >= 1 and self.wash_batch >= 1
-        assert any(d["category"] == "main" for d in self.dishes), "至少要有一道主菜"
-        for d in self.dishes:
-            assert d["category"] in ("main", "dessert")
-            assert d["cook_time"] >= 1
+        o = self.orders
+        assert abs(sum(o["dishes_per_order_probs"]) - 1.0) < 1e-6
+        assert o["patience_min"] <= o["patience_max"]
+
+
+def resolve_path(p: Optional[str]) -> Optional[str]:
+    """Look up a relative path in the current directory first, then in the project root."""
+    if p is None or os.path.isabs(p) or os.path.exists(p):
+        return p
+    return os.path.join(PROJECT_ROOT, p)
 
 
 # ---------------------------------------------------------------------------
-# 内部数据结构
+# Internal data structures
 # ---------------------------------------------------------------------------
 @dataclass
-class OrderItem:
-    """一道菜。"""
-    dish: int
-    status: int = DISH_PENDING
-    pass_wait: int = 0             # 在出餐口上已经放了几步
+class Item:
+    """One thing in a hand or on a counter: a food item or a plate."""
+    kind: str                      # "food" or "plate"
+    comp: Optional[str] = None     # food state, e.g. "tomato:chopped" (when kind == food)
+    contents: list = field(default_factory=list)  # items on the plate (when kind == plate)
+    placed_by: int = -1            # last agent that put it on a counter (used to count handoffs)
 
 
 @dataclass
-class Group:
-    """一组顾客。"""
-    gid: int
-    size: int
-    patience: float
-    patience_init: float
-    arrival_t: int
-    seated_t: int = -1
-    ordered_t: int = -1
-    main_wait: float = 0.0         # 到达 → 主菜上齐
-    dessert_start_t: int = -1
-    dessert_wait: float = 0.0      # 甜点阶段开始 → 甜点上齐
-    dessert_count: int = 0
-    bill: float = 0.0              # 已送到桌上的菜的价格之和
-    n_delivered: int = 0
-    n_cold: int = 0
+class Cooker:
+    tool: str                      # "pot" or "oven"
+    contents: list = field(default_factory=list)
+    status: int = C_EMPTY
+    remaining: int = 0             # cooking steps left
+    total: int = 0
+    done_for: int = 0              # steps since it finished cooking
+    output: Optional[str] = None
 
 
 @dataclass
-class Table:
-    capacity: int
-    state: int = EMPTY
-    group: Optional[Group] = None
-    phase: int = PHASE_MAIN
-    items: list = field(default_factory=list)   # 当前阶段的菜
-    plates: int = 0                # 桌上的盘子数（清桌时送回洗碗池）
-    eat_remaining: int = 0
-
-
-@dataclass
-class StoveTask:
-    item: OrderItem
-    table: int
-    gid: int
-    remaining: int
+class Task:
+    target: int                    # target station
+    travel: int                    # travel steps left
+    kind: str                      # interaction type
+    work: int                      # interaction steps left
+    arrived: bool = False
 
 
 # ---------------------------------------------------------------------------
-# 核心环境
+# Core environment
 # ---------------------------------------------------------------------------
-class RestaurantCore:
-    def __init__(self, config: RestaurantConfig):
+class KitchenCore:
+    def __init__(self, config: KitchenConfig):
         self.cfg = config
-        self.N = len(config.table_sizes)
-        self.max_party = len(config.party_size_probs)
-        self.n_dishes = len(config.dishes)
-        self.main_ids = [i for i, d in enumerate(config.dishes) if d["category"] == "main"]
-        self.dessert_ids = [i for i, d in enumerate(config.dishes) if d["category"] == "dessert"]
-        self.main_p = self._weights(self.main_ids)
-        self.dessert_p = self._weights(self.dessert_ids) if self.dessert_ids else None
-        self.max_cook_time = max(d["cook_time"] for d in config.dishes)
-        self.max_price = max(d["price"] for d in config.dishes)
-        if config.arrival_schedule:
-            self.max_rate = max(r for _, r in config.arrival_schedule)
-        else:
-            self.max_rate = config.arrival_rate
+        self.book = RecipeBook.from_json(resolve_path(config.recipes_file), config.menu)
+        self.layout = Layout.from_json(resolve_path(config.layout_file))
+        self.S = self.layout.S
+        self.n_actions = self.S + 1
+        self.agent_names = [a["name"] for a in config.agents]
+        sched = config.orders.get("arrival_schedule")
+        self.max_rate = max([r for _, r in sched] if sched else [config.orders["arrival_rate"]])
         self.max_rate = max(self.max_rate, 1e-8)
-        self.rng = np.random.default_rng()
-
-    def _weights(self, ids):
-        w = np.array([self.cfg.dishes[i].get("weight", 1.0) for i in ids], dtype=float)
-        return w / w.sum()
-
-    # ------------------------------------------------------------------
-    # 动作编号
-    # ------------------------------------------------------------------
-    # 厨师：0 空闲/继续 | 1..N 开始做第 k 号桌的一道菜 | N+1 洗一批盘子
-    @property
-    def n_chef_actions(self) -> int:
-        return self.N + 2
-
-    # 服务员：0 空闲/继续 | 带位 1..N | 点单 N+1..2N | 上菜 2N+1..3N | 清桌 3N+1..4N
-    @property
-    def n_server_actions(self) -> int:
-        return 4 * self.N + 1
-
-    def chef_action_name(self, a: int) -> str:
-        if a == 0:
-            return "空闲"
-        if a <= self.N:
-            return f"做{a - 1}号桌的菜"
-        return "洗盘子"
-
-    def server_action_name(self, a: int) -> str:
-        if a == 0:
-            return "空闲"
-        kind, i = divmod(a - 1, self.N)
-        return f"{['带位到', '点单', '上菜到', '清理'][kind]}{i}号桌"
+        self._fixed_orders = None
+        if config.orders.get("orders_file"):
+            self._fixed_orders = load_orders_csv(resolve_path(config.orders["orders_file"]))
 
     # ------------------------------------------------------------------
     # reset / step
     # ------------------------------------------------------------------
-    def reset(self, seed: Optional[int] = None) -> dict:
-        if seed is not None:
-            self.rng = np.random.default_rng(seed)
-        cfg = self.cfg
+    def reset(self, seed: Optional[int] = None, orders: Optional[list] = None) -> dict:
+        """`orders` can be passed directly (for tests or replays); otherwise the CSV is used
+        or orders are generated from the seed."""
+        cfg, L = self.cfg, self.layout
         self.t = 0
-        self.tables = [Table(capacity=c) for c in cfg.table_sizes]
-        self.queue: list[Group] = []
-        self.clean_plates = cfg.n_plates - cfg.initial_dirty_plates
-        self.dirty_plates = cfg.initial_dirty_plates   # 洗碗池里的脏盘子
-        self.stoves: list[StoveTask] = []
-        self.chef_busy = 0           # 厨师剩余锁定步数（备菜或洗碗）
-        self.washing = 0             # 正在洗的盘子数
-        self.server_busy = 0
-        self._next_gid = 0
-        self.stats = {
-            "revenue": 0.0, "bill_total": 0.0, "tip_total": 0.0,
-            "groups_paid": 0, "customers_paid": 0,
-            "sum_tip_rate": 0.0,
-            "walkaway_groups": 0, "walkaway_people": 0,
-            "walkaway_queue_groups": 0, "walkaway_table_groups": 0,
-            "balked_groups": 0, "balked_people": 0,
-            "arrived_groups": 0, "arrived_people": 0,
-            "dessert_phases": 0,      # 进入甜点阶段的组数
-            "dessert_served": 0,      # 吃完甜点的组数
-            "dessert_abandoned": 0,   # 甜点阶段等不及离开的组数
-            "dishes_delivered": 0, "cold_dishes": 0, "wasted_dishes": 0,
-            "seats_offered": 0, "seats_used": 0,   # 入座时的桌子容量与实际人数，算座位利用率
-            "invalid_chef": 0, "invalid_server": 0,
-            "plate_shortage_steps": 0, "pass_full_steps": 0, "stoves_full_steps": 0,
-            "chef_idle_steps": 0, "server_idle_steps": 0,
-            "sum_wait_queue": 0.0, "n_wait_queue": 0,   # 到达 → 入座
-            "sum_wait_order": 0.0, "n_wait_order": 0,   # 入座 → 点主菜
-            "sum_wait_main": 0.0, "n_wait_main": 0,     # 到达 → 主菜上齐（小费用的等待）
-        }
-        self._arrivals(self._new_events())  # 开局先来一批顾客，避免前几步空转
+        self.pos = list(L.agent_starts)
+        self.holding: list = [None, None]
+        self.task: list = [None, None]
+        self.counter = {i: None for i, k in enumerate(L.kinds) if k == "counter"}
+        self.cookers = {i: Cooker(k) for i, k in enumerate(L.kinds) if k in ("pot", "oven")}
+        self.clean_plates = cfg.n_plates - cfg.initial_dirty_plates  # clean plates on the rack
+        self.sink_dirty = cfg.initial_dirty_plates                    # dirty plates in the sink
+        self.returning: list = []                                     # dirty plates on their way back (arrival times)
+
+        if orders is not None:
+            src = orders
+        elif self._fixed_orders is not None:
+            src = self._fixed_orders
+        else:
+            src = generate_orders(cfg.orders, cfg.menu, cfg.episode_length, seed or 0)
+        self.future_orders = sorted((o.copy() for o in src), key=lambda o: o.arrival_t)
+        self.open_orders: list = []
+
+        self.stats = self._new_stats()
+        self.step_log: list = []
+        self._ev = self._new_events()
+        self._release_orders(self._ev)
         return self.get_state()
 
-    def step(self, chef_action: int, server_action: int):
-        """返回 (state, reward, terminated, truncated, info)。
-        terminated 恒为 False（餐厅不会"失败"），时间到了 truncated=True。"""
+    def step(self, actions):
+        """actions = (agent 0 action, agent 1 action).
+        Returns (state, reward, terminated, truncated, info)."""
         ev = self._new_events()
-        self._apply_chef(int(chef_action), ev)
-        self._apply_server(int(server_action), ev)
-        self._tick_kitchen(ev)
-        self._tick_server()
-        self._tick_pass()
-        self._tick_eating(ev)
-        self._tick_patience(ev)
-        self._arrivals(ev)
+        self._ev = ev
+        self.step_log = []
+        acts = [int(actions[0]), int(actions[1])]
+
+        for a in (0, 1):
+            self._assign(a, acts[a], ev)
+        for a in (0, 1):
+            self._advance(a, ev)
+        self._tick_cookers(ev)
+        self._tick_plates()
+        self._expire_orders(ev)
+        self.t += 1
+        self._release_orders(ev)
         self._update_step_stats()
 
-        self.t += 1
         reward = compute_reward(ev, self.cfg.reward)
         truncated = self.t >= self.cfg.episode_length
-        info = {"events": ev, **self.summary()}
+        info = {"events": ev, "log": self.step_log, **self.summary()}
         return self.get_state(), reward, False, truncated, info
 
+    # ------------------------------------------------------------------
+    # Legal actions
+    # ------------------------------------------------------------------
+    def action_mask(self, a: int):
+        m = [False] * self.n_actions
+        m[0] = True
+        if self.task[a] is not None:      # busy: can only continue
+            return m
+        for s in range(self.S):
+            m[s + 1] = not self._claimed_by_other(a, s) and self._plan(a, s) is not None
+        return m
+
+    def _claimed_by_other(self, a: int, s: int) -> bool:
+        task = self.task[1 - a]
+        return task is not None and task.target == s
+
+    # ------------------------------------------------------------------
+    # Interaction rules: for (agent, station), what can be done now and how many steps it takes
+    # ------------------------------------------------------------------
+    def _skill(self, a: int, name: str):
+        return self.cfg.agents[a]["skills"].get(name)
+
+    def _plan(self, a: int, s: int):
+        """Returns (interaction type, interaction steps), or None if no interaction applies."""
+        L, book, h = self.layout, self.book, self.holding[a]
+        if not L.allowed[a][s]:
+            return None
+        kind = L.kinds[s]
+
+        if kind == "dispenser":
+            comp = f"{L.stations[s]['ingredient']}:raw"
+            if not book.can_dispense(L.stations[s]["ingredient"]):
+                return None                # not used by this menu
+            if h is None:
+                return ("take", 1)
+            if h.kind == "plate" and book.plate_valid(h.contents + [comp]):
+                return ("add_to_plate", 1)
+
+        elif kind == "plate_rack":
+            if h is None and self.clean_plates > 0:
+                return ("take_plate", 1)
+
+        elif kind == "counter":
+            it = self.counter[s]
+            if h is None and it is not None:
+                return ("pick", 1)
+            if h is not None and it is None:
+                return ("place", 1)
+            if h is not None and it is not None:
+                if h.kind == "plate" and it.kind == "food" and book.plate_valid(h.contents + [it.comp]):
+                    return ("plate_from_counter", 1)
+                if h.kind == "food" and it.kind == "plate" and book.plate_valid(it.contents + [h.comp]):
+                    return ("food_onto_plate", 1)
+
+        elif kind in ("cutting_board", "pan"):
+            if h is not None and h.kind == "food":
+                pname, out = book.process_output(kind, h.comp)
+                t = self._skill(a, pname) if pname else None
+                if out is not None and t is not None:
+                    return (pname, int(t))
+
+        elif kind in ("pot", "oven"):
+            c = self.cookers[s]
+            if c.status in (C_EMPTY, C_FILLING):
+                if h is not None and h.kind == "food" and book.cooker_can_add(kind, c.contents, h.comp):
+                    return ("cooker_add", 1)
+            elif c.status == C_DONE:
+                if h is not None and h.kind == "plate" and book.plate_valid(h.contents + [c.output]):
+                    return ("cooker_collect", 1)
+            elif c.status == C_BURNT:
+                if h is None:
+                    return ("cooker_clean", self.cfg.cooker_clean_time)
+
+        elif kind == "sink":
+            t = self._skill(a, "wash")
+            if h is None and self.sink_dirty > 0 and t is not None:
+                return ("wash", int(t))
+
+        elif kind == "trash":
+            if h is not None and (h.kind == "food" or h.contents):
+                return ("trash", 1)
+
+        elif kind == "pass":
+            if h is not None and h.kind == "plate":
+                dish = book.dish_of(h.contents)
+                if dish is not None and self._order_for(dish) is not None:
+                    return ("deliver", 1)
+        return None
+
+    # ------------------------------------------------------------------
+    # Advancing actions
+    # ------------------------------------------------------------------
+    def _assign(self, a: int, act: int, ev: dict):
+        if self.task[a] is not None or act == 0:
+            return
+        if not (0 < act < self.n_actions) or not self.action_mask(a)[act]:
+            if 0 < act < self.n_actions and self._claimed_by_other(a, act - 1) \
+                    and self._plan(a, act - 1) is not None:
+                # Both agents picked the same station in the same step: agent 0 goes first,
+                # agent 1's action is dropped for this step (not counted as invalid)
+                ev["conflict"] += 1
+                self.stats["conflicts"] += 1
+                self._log(a, "conflict", act - 1, "")
+                return
+            ev["invalid"] += 1
+            self.stats["invalid"][a] += 1
+            self._log(a, "invalid", None, f"action {act}")
+            return
+        s = act - 1
+        kind, work = self._plan(a, s)
+        travel = self.layout.travel_time(self.pos[a], s, self.cfg.agents[a]["move_speed"])
+        self.task[a] = Task(s, travel, kind, work)
+
+    def _advance(self, a: int, ev: dict):
+        task = self.task[a]
+        if task is None:
+            self.stats["idle_steps"][a] += 1
+            return
+        if not task.arrived:
+            if task.travel > 0:            # walking
+                self.stats["move_steps"][a] += 1
+                task.travel -= 1
+                if task.travel > 0:
+                    return
+                self._arrive(a, task)
+                return                     # no interaction on the arrival step
+            self._arrive(a, task)          # already at this station
+            if self.task[a] is None:
+                return
+        # interacting
+        self.stats["work_steps"][a] += 1
+        task.work -= 1
+        if task.work > 0:
+            return
+        plan = self._plan(a, task.target)
+        if plan is None or plan[0] != task.kind:
+            self._fail(a, task)
+            return
+        self._execute(a, task.target, task.kind, ev)
+        self.task[a] = None
+
+    def _arrive(self, a: int, task: Task):
+        self.pos[a] = task.target
+        task.arrived = True
+        plan = self._plan(a, task.target)
+        if plan is None or plan[0] != task.kind:
+            self._fail(a, task)
+
+    def _fail(self, a: int, task: Task):
+        self.stats["failed"][a] += 1
+        self._ev["failed"] += 1
+        self._log(a, "failed", task.target, task.kind)
+        self.task[a] = None
+
+    # ------------------------------------------------------------------
+    # Applying interactions
+    # ------------------------------------------------------------------
+    def _execute(self, a: int, s: int, kind: str, ev: dict):
+        book, h, st = self.book, self.holding[a], self.stats
+        detail = ""
+        if kind == "take":
+            comp = f"{self.layout.stations[s]['ingredient']}:raw"
+            self.holding[a] = Item("food", comp)
+            detail = book.comp_name(comp)
+        elif kind == "add_to_plate":
+            comp = f"{self.layout.stations[s]['ingredient']}:raw"
+            h.contents.append(comp)
+            ev["plate_add"] += 1
+            detail = book.comp_name(comp)
+        elif kind == "take_plate":
+            self.clean_plates -= 1
+            self.holding[a] = Item("plate")
+        elif kind == "pick":
+            it = self.counter[s]
+            self.counter[s] = None
+            self.holding[a] = it
+            self._count_handoff(a, it, ev)
+            detail = self._item_name(it)
+        elif kind == "place":
+            h.placed_by = a
+            self.counter[s] = h
+            self.holding[a] = None
+            detail = self._item_name(h)
+        elif kind == "plate_from_counter":
+            it = self.counter[s]
+            self.counter[s] = None
+            h.contents.append(it.comp)
+            self._count_handoff(a, it, ev)
+            ev["plate_add"] += 1
+            detail = book.comp_name(it.comp)
+        elif kind == "food_onto_plate":
+            it = self.counter[s]
+            it.contents.append(h.comp)
+            it.placed_by = a
+            self.holding[a] = None
+            ev["plate_add"] += 1
+            detail = book.comp_name(h.comp)
+        elif kind in ("chop", "fry"):
+            _, out = book.process_output(self.layout.kinds[s], h.comp)
+            detail = f"{book.comp_name(h.comp)} -> {book.comp_name(out)}"
+            h.comp = out
+            ev[kind] += 1
+        elif kind == "cooker_add":
+            c = self.cookers[s]
+            c.contents.append(h.comp)
+            detail = book.comp_name(h.comp)
+            self.holding[a] = None
+            r = book.cooker_match(c.tool, c.contents)
+            if r is not None:
+                c.status, c.remaining, c.total, c.output = C_COOKING, r["time"], r["time"], r["output"]
+                ev["cooker_start"] += 1
+            else:
+                c.status = C_FILLING
+        elif kind == "cooker_collect":
+            c = self.cookers[s]
+            h.contents.append(c.output)
+            detail = book.comp_name(c.output)
+            self.cookers[s] = Cooker(c.tool)
+            ev["cooker_collect"] += 1
+        elif kind == "cooker_clean":
+            self.cookers[s] = Cooker(self.cookers[s].tool)
+        elif kind == "wash":
+            self.sink_dirty -= 1
+            self.clean_plates += 1
+            ev["plate_washed"] += 1
+        elif kind == "trash":
+            n = 1 if h.kind == "food" else len(h.contents)
+            detail = self._item_name(h)
+            if h.kind == "food":
+                self.holding[a] = None
+            else:
+                h.contents = []
+            ev["wasted"] += n
+            st["wasted"] += n
+        elif kind == "deliver":
+            detail = self._deliver(a, ev)
+        st["actions"][a][kind] = st["actions"][a].get(kind, 0) + 1
+        self._log(a, kind, s, detail)
+
+    def _count_handoff(self, a: int, it: Item, ev: dict):
+        if it.placed_by not in (-1, a):
+            ev["handoff"] += 1
+            self.stats["handoffs"] += 1
+
+    def _order_for(self, dish: str):
+        """Among open orders that still need this dish, the one with the earliest deadline."""
+        cands = [o for o in self.open_orders if o.remaining[dish] > 0]
+        return min(cands, key=lambda o: o.deadline_t) if cands else None
+
+    def _deliver(self, a: int, ev: dict):
+        dish = self.book.dish_of(self.holding[a].contents)
+        order = self._order_for(dish)
+        price = self.book.price(dish)
+        order.remaining[dish] -= 1
+        order.bill += price
+        self.holding[a] = None
+        self.returning.append(self.t + self.cfg.dirty_return_delay)
+        ev["bill"] += price
+        ev["dish_delivered"] += 1
+        st = self.stats
+        st["bill_total"] += price
+        st["dishes_delivered"] += 1
+        detail = f"{self.book.dish_name(dish)} -> order {order.oid}"
+        if sum(order.remaining.values()) == 0:
+            wait = self.t + 1 - order.arrival_t
+            rate = self.tip_rate(wait)
+            tip = order.bill * rate
+            ev["tip"] += tip
+            ev["orders_completed"] += 1
+            st["tip_total"] += tip
+            st["orders_completed"] += 1
+            st["sum_tip_rate"] += rate
+            st["sum_completion_time"] += wait
+            self.open_orders.remove(order)
+            self._log(-1, "order_completed", None,
+                      f"order {order.oid} took {wait} steps, tip {tip:.1f}")
+        return detail
+
+    def tip_rate(self, wait: float) -> float:
+        cfg = self.cfg
+        if wait <= cfg.tip_grace_wait:
+            return cfg.tip_max_rate
+        frac = (wait - cfg.tip_grace_wait) / (cfg.tip_zero_wait - cfg.tip_grace_wait)
+        return cfg.tip_max_rate * max(0.0, 1.0 - frac)
+
+    # ------------------------------------------------------------------
+    # Time-driven updates
+    # ------------------------------------------------------------------
+    def _tick_cookers(self, ev: dict):
+        for s, c in self.cookers.items():
+            if c.status == C_COOKING:
+                c.remaining -= 1
+                if c.remaining <= 0:
+                    c.status, c.done_for = C_DONE, 0
+                    self._log(-1, "cooker_done", s, self.book.comp_name(c.output))
+            elif c.status == C_DONE:
+                c.done_for += 1
+                if c.done_for > self.cfg.burn_after:
+                    c.status = C_BURNT
+                    ev["burnt"] += 1
+                    self.stats["burnt"] += 1
+                    self._log(-1, "burnt", s, self.book.comp_name(c.output))
+
+    def _tick_plates(self):
+        back = [t for t in self.returning if t <= self.t]
+        self.returning = [t for t in self.returning if t > self.t]
+        self.sink_dirty += len(back)
+
+    def _expire_orders(self, ev: dict):
+        kept = []
+        for o in self.open_orders:
+            if self.t + 1 >= o.deadline_t:
+                ev["orders_expired"] += 1
+                self.stats["orders_expired"] += 1
+                self.stats["bill_lost"] += sum(self.book.price(d) * n for d, n in o.remaining.items())
+                self._log(-1, "order_expired", None, f"order {o.oid}")
+            else:
+                kept.append(o)
+        self.open_orders = kept
+
+    def _release_orders(self, ev: dict):
+        while self.future_orders and self.future_orders[0].arrival_t <= self.t:
+            o = self.future_orders.pop(0)
+            self.open_orders.append(o)
+            self.stats["orders_arrived"] += 1
+            self._log(-1, "order_arrived", None,
+                      f"order {o.oid}: " + " + ".join(self.book.dish_name(d) for d in o.dishes))
+
+    def _update_step_stats(self):
+        st = self.stats
+        if self.clean_plates == 0:
+            st["no_clean_plate_steps"] += 1
+        st["sum_open_orders"] += len(self.open_orders)
+        # processed food sitting on counters, waiting to be used (prepping ahead)
+        st["sum_prepped_on_counter"] += sum(
+            1 for it in self.counter.values()
+            if it is not None and it.kind == "food" and not it.comp.endswith(":raw"))
+
+    # ------------------------------------------------------------------
+    # Statistics
+    # ------------------------------------------------------------------
     @staticmethod
     def _new_events() -> dict:
         ev = {k: 0 for k in [
-            "groups_paid", "walkaway_groups", "walkaway_people", "balked_groups",
-            "balked_people", "dessert_abandoned", "invalid_chef", "invalid_server",
-            "seated", "order_taken", "dish_cooked", "dish_delivered", "cold_delivered",
-            "plate_washed", "table_cleared", "wasted",
+            "orders_completed", "orders_expired", "dish_delivered", "burnt", "wasted",
+            "invalid", "failed", "chop", "fry", "cooker_start", "cooker_collect",
+            "plate_add", "plate_washed", "handoff", "conflict",
         ]}
         ev["bill"] = 0.0
         ev["tip"] = 0.0
         return ev
 
-    # ------------------------------------------------------------------
-    # 到达率
-    # ------------------------------------------------------------------
-    def arrival_rate_at(self, t: float) -> float:
-        sched = self.cfg.arrival_schedule
-        if not sched:
-            return self.cfg.arrival_rate
-        xs = [p[0] for p in sched]
-        ys = [p[1] for p in sched]
-        return float(np.interp(t, xs, ys))
-
-    # ------------------------------------------------------------------
-    # 合法动作
-    # ------------------------------------------------------------------
-    def chef_mask(self) -> np.ndarray:
-        m = np.zeros(self.n_chef_actions, dtype=bool)
-        m[0] = True
-        if self.chef_busy > 0:      # 忙碌中只能继续
-            return m
-        for k in range(self.N):
-            m[1 + k] = self._can_cook(k)
-        m[self.N + 1] = self.dirty_plates > 0
-        return m
-
-    def server_mask(self) -> np.ndarray:
-        m = np.zeros(self.n_server_actions, dtype=bool)
-        m[0] = True
-        if self.server_busy > 0:
-            return m
-        N = self.N
-        for i, tb in enumerate(self.tables):
-            m[1 + i] = tb.state == EMPTY and self._first_fitting_group(tb.capacity) is not None
-            m[1 + N + i] = tb.state == WAIT_ORDER
-            m[1 + 2 * N + i] = tb.state == WAIT_FOOD and any(
-                it.status == DISH_READY for it in tb.items)
-            m[1 + 3 * N + i] = tb.state == DIRTY
-        return m
-
-    def _can_cook(self, k: int) -> bool:
-        tb = self.tables[k]
-        return (
-            tb.state == WAIT_FOOD
-            and any(it.status == DISH_PENDING for it in tb.items)
-            and self.clean_plates > 0
-            and len(self.stoves) < self.cfg.n_stoves
-            and self._pass_count() + len(self.stoves) < self.cfg.pass_capacity
-        )
-
-    def _pass_count(self) -> int:
-        return sum(it.status == DISH_READY for tb in self.tables for it in tb.items)
-
-    def _first_fitting_group(self, capacity: int) -> Optional[int]:
-        """队列里最早到达、且能坐进这张桌子的一组（返回队列下标）。"""
-        for idx, g in enumerate(self.queue):
-            if g.size <= capacity:
-                return idx
-        return None
-
-    # ------------------------------------------------------------------
-    # 动作执行
-    # ------------------------------------------------------------------
-    def _apply_chef(self, a: int, ev: dict):
-        self._chef_active = self.chef_busy > 0   # 本步厨师是否在干活（用于统计空闲）
-        if self.chef_busy > 0 or a == 0:
-            return
-        if not self.chef_mask()[a]:
-            ev["invalid_chef"] += 1
-            self.stats["invalid_chef"] += 1
-            return
-        cfg = self.cfg
-        self._chef_active = True
-        if a <= self.N:
-            k = a - 1
-            tb = self.tables[k]
-            # 同一桌里先做最费时的菜，让一桌的菜尽量同时出
-            pending = [it for it in tb.items if it.status == DISH_PENDING]
-            item = max(pending, key=lambda it: cfg.dishes[it.dish]["cook_time"])
-            item.status = DISH_COOKING
-            self.clean_plates -= 1
-            self.stoves.append(StoveTask(item, k, tb.group.gid, cfg.dishes[item.dish]["cook_time"]))
-            self.chef_busy = cfg.prep_time
-        else:
-            n = min(cfg.wash_batch, self.dirty_plates)
-            self.dirty_plates -= n
-            self.washing = n
-            self.chef_busy = cfg.wash_time
-
-    def _apply_server(self, a: int, ev: dict):
-        self._server_active = self.server_busy > 0
-        if self.server_busy > 0 or a == 0:
-            return
-        if not self.server_mask()[a]:
-            ev["invalid_server"] += 1
-            self.stats["invalid_server"] += 1
-            return
-        self._server_active = True
-        kind, i = divmod(a - 1, self.N)
-        tb = self.tables[i]
-        cfg = self.cfg
-        if kind == 0:    # 带位：队列中最早到达、且坐得下的一组
-            g = self.queue.pop(self._first_fitting_group(tb.capacity))
-            g.seated_t = self.t
-            self._record_wait("queue", self.t - g.arrival_t)
-            self.stats["seats_offered"] += tb.capacity
-            self.stats["seats_used"] += g.size
-            tb.state, tb.group, tb.phase = WAIT_ORDER, g, PHASE_MAIN
-            ev["seated"] += 1
-            self.server_busy = cfg.seat_time
-        elif kind == 1:  # 点单：主菜阶段每人一道主菜；甜点阶段按之前决定的份数点甜点
-            g = tb.group
-            if tb.phase == PHASE_MAIN:
-                dishes = self.rng.choice(self.main_ids, size=g.size, p=self.main_p)
-                g.ordered_t = self.t
-                self._record_wait("order", self.t - g.seated_t)
-            else:
-                dishes = self.rng.choice(self.dessert_ids, size=g.dessert_count, p=self.dessert_p)
-            tb.items = [OrderItem(int(d)) for d in dishes]
-            tb.state = WAIT_FOOD
-            ev["order_taken"] += 1
-            self.server_busy = cfg.order_time
-        elif kind == 2:  # 上菜：把这桌在出餐口上的菜全部端走
-            self._deliver(tb, ev)
-            self.server_busy = cfg.deliver_time
-        else:            # 清桌：桌上的盘子全部送回洗碗池
-            self.dirty_plates += tb.plates
-            self._reset_table(tb)
-            ev["table_cleared"] += 1
-            self.server_busy = cfg.clear_time
-
-    def _deliver(self, tb: Table, ev: dict):
-        cfg, g = self.cfg, tb.group
-        for it in tb.items:
-            if it.status != DISH_READY:
-                continue
-            it.status = DISH_DELIVERED
-            tb.plates += 1
-            g.bill += cfg.dishes[it.dish]["price"]
-            g.n_delivered += 1
-            ev["dish_delivered"] += 1
-            self.stats["dishes_delivered"] += 1
-            if it.pass_wait > cfg.cold_after:
-                g.n_cold += 1
-                ev["cold_delivered"] += 1
-                self.stats["cold_dishes"] += 1
-        if all(it.status == DISH_DELIVERED for it in tb.items):  # 上齐了才开始吃
-            tb.state = EATING
-            if tb.phase == PHASE_MAIN:
-                g.main_wait = self.t - g.arrival_t
-                self._record_wait("main", g.main_wait)
-                lo, hi = cfg.eat_time_min, cfg.eat_time_max
-            else:
-                g.dessert_wait = self.t - g.dessert_start_t
-                lo, hi = cfg.dessert_eat_time_min, cfg.dessert_eat_time_max
-            tb.eat_remaining = int(self.rng.integers(lo, hi + 1))
-
-    # ------------------------------------------------------------------
-    # 时间推进
-    # ------------------------------------------------------------------
-    def _tick_kitchen(self, ev: dict):
-        # 灶台
-        still = []
-        for task in self.stoves:
-            task.remaining -= 1
-            if task.remaining > 0:
-                still.append(task)
-                continue
-            tb = self.tables[task.table]
-            alive = (tb.group is not None and tb.group.gid == task.gid
-                     and any(it is task.item for it in tb.items))
-            if alive:
-                task.item.status = DISH_READY
-                task.item.pass_wait = 0
-                ev["dish_cooked"] += 1
-            else:  # 顾客已经走了，菜作废，盘子变脏
-                self.dirty_plates += 1
-                ev["wasted"] += 1
-                self.stats["wasted_dishes"] += 1
-        self.stoves = still
-        # 厨师锁定
-        if self.chef_busy > 0:
-            self.chef_busy -= 1
-            if self.chef_busy == 0 and self.washing > 0:
-                self.clean_plates += self.washing
-                ev["plate_washed"] += self.washing
-                self.washing = 0
-
-    def _tick_server(self):
-        if self.server_busy > 0:
-            self.server_busy -= 1
-
-    def _tick_pass(self):
-        for tb in self.tables:
-            for it in tb.items:
-                if it.status == DISH_READY:
-                    it.pass_wait += 1
-
-    def _tick_eating(self, ev: dict):
-        cfg = self.cfg
-        for tb in self.tables:
-            if tb.state != EATING:
-                continue
-            tb.eat_remaining -= 1
-            if tb.eat_remaining > 0:
-                continue
-            g = tb.group
-            if tb.phase == PHASE_MAIN:
-                n_dessert = int(self.rng.binomial(g.size, cfg.dessert_prob)) if self.dessert_ids else 0
-                if n_dessert > 0:   # 进入甜点阶段，等服务员来点甜点
-                    tb.phase, tb.state, tb.items = PHASE_DESSERT, WAIT_ORDER, []
-                    g.dessert_count = n_dessert
-                    g.dessert_start_t = self.t
-                    g.patience = g.patience_init = cfg.dessert_patience
-                    self.stats["dessert_phases"] += 1
-                    continue
-                self._pay(tb, ev, include_dessert=False)
-            else:
-                self.stats["dessert_served"] += 1
-                self._pay(tb, ev, include_dessert=True)
-
-    def _tick_patience(self, ev: dict):
-        cfg = self.cfg
-        kept = []
-        for g in self.queue:    # 门口排队的顾客
-            g.patience -= cfg.patience_decay_queue
-            if g.patience <= 0:
-                self._count_walkaway(g, ev)
-                self.stats["walkaway_queue_groups"] += 1
-            else:
-                kept.append(g)
-        self.queue = kept
-        for tb in self.tables:  # 已入座的顾客
-            if tb.state == WAIT_ORDER:
-                tb.group.patience -= cfg.patience_decay_order
-            elif tb.state == WAIT_FOOD:
-                tb.group.patience -= cfg.patience_decay_food
-            else:
-                continue
-            if tb.group.patience > 0:
-                continue
-            self._discard_ready(tb, ev)  # 出餐口上这桌的菜作废；灶台上的做完时作废
-            if tb.phase == PHASE_DESSERT:
-                # 甜点等不及：付主菜的钱离开（小费只按主菜阶段的等待算）
-                ev["dessert_abandoned"] += 1
-                self.stats["dessert_abandoned"] += 1
-                self._pay(tb, ev, include_dessert=False)
-            else:
-                self._count_walkaway(tb.group, ev)
-                self.stats["walkaway_table_groups"] += 1
-                if tb.plates > 0:  # 已经上了部分菜，桌上有盘子要清理
-                    tb.state, tb.group, tb.items = DIRTY, None, []
-                else:
-                    self._reset_table(tb)
-
-    def _arrivals(self, ev: dict):
-        cfg = self.cfg
-        n = self.rng.poisson(self.arrival_rate_at(self.t))
-        for _ in range(n):
-            size = int(self.rng.choice(self.max_party, p=cfg.party_size_probs)) + 1
-            self.stats["arrived_groups"] += 1
-            self.stats["arrived_people"] += size
-            if len(self.queue) >= cfg.max_queue:
-                ev["balked_groups"] += 1
-                ev["balked_people"] += size
-                self.stats["balked_groups"] += 1
-                self.stats["balked_people"] += size
-                continue
-            p = float(self.rng.uniform(cfg.patience_min, cfg.patience_max))
-            self.queue.append(Group(self._next_gid, size, p, p, self.t))
-            self._next_gid += 1
-
-    def _update_step_stats(self):
-        s = self.stats
-        if self.clean_plates == 0 and any(
-            it.status == DISH_PENDING for tb in self.tables for it in tb.items
-        ):
-            s["plate_shortage_steps"] += 1
-        if self._pass_count() >= self.cfg.pass_capacity:
-            s["pass_full_steps"] += 1
-        if len(self.stoves) >= self.cfg.n_stoves:
-            s["stoves_full_steps"] += 1
-        if not self._chef_active:      # 本步既没在忙、也没开始新动作
-            s["chef_idle_steps"] += 1
-        if not self._server_active:
-            s["server_idle_steps"] += 1
-
-    # ------------------------------------------------------------------
-    # 付款与小费
-    # ------------------------------------------------------------------
-    def tip_rate(self, wait: float, cold_frac: float) -> float:
-        cfg = self.cfg
-        if wait <= cfg.tip_grace_wait:
-            w = 1.0
-        else:
-            w = max(0.0, 1.0 - (wait - cfg.tip_grace_wait) / (cfg.tip_zero_wait - cfg.tip_grace_wait))
-        return cfg.tip_max_rate * w * (1.0 - cfg.cold_tip_penalty * cold_frac)
-
-    def _pay(self, tb: Table, ev: dict, include_dessert: bool):
-        g = tb.group
-        wait = g.main_wait + (g.dessert_wait if include_dessert else 0.0)
-        cold_frac = g.n_cold / g.n_delivered if g.n_delivered else 0.0
-        rate = self.tip_rate(wait, cold_frac)
-        tip = g.bill * rate
-        ev["bill"] += g.bill
-        ev["tip"] += tip
-        ev["groups_paid"] += 1
-        s = self.stats
-        s["revenue"] += g.bill + tip
-        s["bill_total"] += g.bill
-        s["tip_total"] += tip
-        s["groups_paid"] += 1
-        s["customers_paid"] += g.size
-        s["sum_tip_rate"] += rate
-        tb.state, tb.group, tb.items = DIRTY, None, []   # 盘子留在桌上，等服务员清理
-
-    # ------------------------------------------------------------------
-    # 工具函数
-    # ------------------------------------------------------------------
-    def _count_walkaway(self, g: Group, ev: dict):
-        ev["walkaway_groups"] += 1
-        ev["walkaway_people"] += g.size
-        self.stats["walkaway_groups"] += 1
-        self.stats["walkaway_people"] += g.size
-
-    def _discard_ready(self, tb: Table, ev: dict):
-        for it in tb.items:
-            if it.status == DISH_READY:
-                self.dirty_plates += 1
-                ev["wasted"] += 1
-                self.stats["wasted_dishes"] += 1
-
     @staticmethod
-    def _reset_table(tb: Table):
-        tb.state, tb.group, tb.phase, tb.items = EMPTY, None, PHASE_MAIN, []
-        tb.plates, tb.eat_remaining = 0, 0
-
-    def _record_wait(self, name: str, dt: float):
-        self.stats[f"sum_wait_{name}"] += dt
-        self.stats[f"n_wait_{name}"] += 1
-
-    def plates_in_use(self) -> int:
-        """灶台、正在洗、出餐口、桌上的盘子数（用于检查盘子守恒）。"""
-        return len(self.stoves) + self.washing + self._pass_count() + sum(
-            tb.plates for tb in self.tables)
-
-    def summary(self) -> dict:
-        """评测用的汇总指标（本回合累计）。"""
-        s = self.stats
-        avg = lambda k: s[f"sum_wait_{k}"] / s[f"n_wait_{k}"] if s[f"n_wait_{k}"] else 0.0
+    def _new_stats() -> dict:
         return {
-            "t": self.t,
-            "revenue": s["revenue"],
-            "bill_total": s["bill_total"],
-            "tip_total": s["tip_total"],
-            "avg_tip_rate": s["sum_tip_rate"] / s["groups_paid"] if s["groups_paid"] else 0.0,
-            "groups_paid": s["groups_paid"],
-            "customers_paid": s["customers_paid"],
-            "walkaway_groups": s["walkaway_groups"],
-            "walkaway_people": s["walkaway_people"],
-            "walkaway_queue_groups": s["walkaway_queue_groups"],
-            "walkaway_table_groups": s["walkaway_table_groups"],
-            "balked_groups": s["balked_groups"],
-            "balked_people": s["balked_people"],
-            "lost_people": s["walkaway_people"] + s["balked_people"],
-            "arrived_groups": s["arrived_groups"],
-            "arrived_people": s["arrived_people"],
-            "dessert_phases": s["dessert_phases"],
-            "dessert_served": s["dessert_served"],
-            "dessert_abandoned": s["dessert_abandoned"],
-            "dishes_delivered": s["dishes_delivered"],
-            "cold_dishes": s["cold_dishes"],
-            "cold_rate": s["cold_dishes"] / s["dishes_delivered"] if s["dishes_delivered"] else 0.0,
-            "wasted_dishes": s["wasted_dishes"],
-            "seat_utilization": s["seats_used"] / s["seats_offered"] if s["seats_offered"] else 0.0,
-            "invalid_chef": s["invalid_chef"],
-            "invalid_server": s["invalid_server"],
-            "plate_shortage_steps": s["plate_shortage_steps"],
-            "pass_full_steps": s["pass_full_steps"],
-            "stoves_full_steps": s["stoves_full_steps"],
-            "chef_idle_steps": s["chef_idle_steps"],
-            "server_idle_steps": s["server_idle_steps"],
-            "avg_wait_queue": avg("queue"),
-            "avg_wait_order": avg("order"),
-            "avg_wait_main": avg("main"),
+            "bill_total": 0.0, "tip_total": 0.0, "bill_lost": 0.0,
+            "orders_arrived": 0, "orders_completed": 0, "orders_expired": 0,
+            "dishes_delivered": 0, "sum_tip_rate": 0.0, "sum_completion_time": 0.0,
+            "burnt": 0, "wasted": 0, "handoffs": 0, "conflicts": 0,
+            "invalid": [0, 0], "failed": [0, 0],
+            "idle_steps": [0, 0], "move_steps": [0, 0], "work_steps": [0, 0],
+            "actions": [{}, {}],              # count of each interaction per agent (division of labor)
+            "no_clean_plate_steps": 0, "sum_open_orders": 0, "sum_prepped_on_counter": 0,
         }
 
+    def summary(self) -> dict:
+        s, n = self.stats, max(self.t, 1)
+        done = s["orders_completed"]
+        out = {
+            "t": self.t,
+            "revenue": s["bill_total"] + s["tip_total"],
+            "bill_total": s["bill_total"],
+            "tip_total": s["tip_total"],
+            "avg_tip_rate": s["sum_tip_rate"] / done if done else 0.0,
+            "orders_arrived": s["orders_arrived"],
+            "orders_completed": done,
+            "orders_expired": s["orders_expired"],
+            "avg_completion_time": s["sum_completion_time"] / done if done else 0.0,
+            "dishes_delivered": s["dishes_delivered"],
+            "burnt": s["burnt"],
+            "wasted": s["wasted"],
+            "handoffs": s["handoffs"],
+            "conflicts": s["conflicts"],
+            "no_clean_plate_steps": s["no_clean_plate_steps"],
+            "avg_open_orders": s["sum_open_orders"] / n,
+            "avg_prepped_on_counter": s["sum_prepped_on_counter"] / n,
+        }
+        for a, name in enumerate(("a0", "a1")):
+            out[f"{name}_idle_steps"] = s["idle_steps"][a]
+            out[f"{name}_move_steps"] = s["move_steps"][a]
+            out[f"{name}_work_steps"] = s["work_steps"][a]
+            out[f"{name}_invalid"] = s["invalid"][a]
+            out[f"{name}_failed"] = s["failed"][a]
+            out[f"{name}_actions"] = dict(s["actions"][a])
+        return out
+
+    def plates_total(self) -> int:
+        """Total number of plates (for the conservation check):
+        rack + sink + returning + in hands + on counters."""
+        n = self.clean_plates + self.sink_dirty + len(self.returning)
+        n += sum(1 for h in self.holding if h is not None and h.kind == "plate")
+        n += sum(1 for it in self.counter.values() if it is not None and it.kind == "plate")
+        return n
+
     # ------------------------------------------------------------------
-    # 状态（原始字典，由各接口自行转成观测向量）
+    # State and display
     # ------------------------------------------------------------------
+    def _log(self, a: int, kind: str, s: Optional[int], detail: str):
+        self.step_log.append({
+            "t": self.t,
+            "agent": self.agent_names[a] if a >= 0 else "",
+            "event": kind,
+            "station": self.layout.names[s] if s is not None else "",
+            "detail": detail,
+        })
+
+    def _item_name(self, it: Optional[Item]) -> str:
+        if it is None:
+            return ""
+        if it.kind == "food":
+            return self.book.comp_name(it.comp)
+        if not it.contents:
+            return "empty plate"
+        return "plate[" + ", ".join(self.book.comp_name(c) for c in it.contents) + "]"
+
     def get_state(self) -> dict:
-        cfg = self.cfg
-        tables = []
-        for tb in self.tables:
-            g = tb.group
-            st = [it.status for it in tb.items]
-            pending_time = sum(cfg.dishes[it.dish]["cook_time"]
-                               for it in tb.items if it.status == DISH_PENDING)
-            ready_waits = [it.pass_wait for it in tb.items if it.status == DISH_READY]
-            if g is None:
-                wait_so_far = 0.0
-            elif tb.phase == PHASE_MAIN:
-                wait_so_far = self.t - g.arrival_t if tb.state in (WAIT_ORDER, WAIT_FOOD) else g.main_wait
-            else:
-                wait_so_far = g.main_wait + (self.t - g.dessert_start_t
-                                             if tb.state in (WAIT_ORDER, WAIT_FOOD) else g.dessert_wait)
-            tables.append({
-                "capacity": tb.capacity,
-                "state": tb.state,
-                "phase": tb.phase,
-                "party_size": g.size if g else 0,
-                "patience_frac": g.patience / g.patience_init if g else 0.0,
-                "eat_remaining": tb.eat_remaining,
-                "n_items": len(tb.items),
-                "n_pending": st.count(DISH_PENDING),
-                "n_cooking": st.count(DISH_COOKING),
-                "n_ready": st.count(DISH_READY),
-                "n_delivered": st.count(DISH_DELIVERED),
-                "pending_cook_time": pending_time,
-                "max_pass_wait": max(ready_waits) if ready_waits else 0,
-                "wait_so_far": wait_so_far,
-                "plates": tb.plates,
+        """Raw state dict (each interface turns it into its own observation vector)."""
+        return {
+            "t": self.t,
+            "arrival_rate": arrival_rate_at(self.cfg.orders, self.t),
+            "pos": list(self.pos),
+            "holding": list(self.holding),
+            "task": list(self.task),
+            "counter": self.counter,
+            "cookers": self.cookers,
+            "clean_plates": self.clean_plates,
+            "sink_dirty": self.sink_dirty,
+            "returning": len(self.returning),
+            "open_orders": sorted(self.open_orders, key=lambda o: o.deadline_t),
+        }
+
+    def snapshot(self) -> dict:
+        """JSON-serializable snapshot of the state, for logs and replays."""
+        L = self.layout
+        agents = []
+        for a in range(2):
+            task = self.task[a]
+            agents.append({
+                "name": self.agent_names[a],
+                "station": L.names[self.pos[a]],
+                "holding": self._item_name(self.holding[a]),
+                "task": None if task is None else {
+                    "target": L.names[task.target], "kind": task.kind,
+                    "travel": task.travel, "work": task.work},
             })
         return {
             "t": self.t,
-            "arrival_rate": self.arrival_rate_at(self.t),
-            "tables": tables,
-            "queue": [{"size": g.size, "patience_frac": g.patience / g.patience_init}
-                      for g in self.queue],
+            "agents": agents,
+            "counters": {L.names[s]: self._item_name(it) for s, it in self.counter.items()},
+            "cookers": {L.names[s]: {
+                "status": COOKER_STATE_NAMES[c.status],
+                "contents": [self.book.comp_name(x) for x in c.contents],
+                "remaining": c.remaining, "done_for": c.done_for}
+                for s, c in self.cookers.items()},
             "clean_plates": self.clean_plates,
-            "dirty_plates": self.dirty_plates,
-            "pass_count": self._pass_count(),
-            "stoves": [{"table": s.table, "remaining": s.remaining} for s in self.stoves],
-            "chef_busy": self.chef_busy,
-            "chef_washing": self.washing > 0,
-            "server_busy": self.server_busy,
+            "sink_dirty": self.sink_dirty,
+            "returning_plates": len(self.returning),
+            "open_orders": [{
+                "id": o.oid, "deadline_t": o.deadline_t,
+                "remaining": {self.book.dish_name(d): n for d, n in o.remaining.items() if n > 0}}
+                for o in sorted(self.open_orders, key=lambda o: o.deadline_t)],
         }
 
     def render_text(self) -> str:
-        cfg = self.cfg
-        q = " ".join(f"{g.size}人" for g in self.queue) or "无"
-        lines = [
-            f"t={self.t:3d}  到达率={self.arrival_rate_at(self.t):.2f}  排队: {q}",
-            f"  干净盘={self.clean_plates} 脏盘={self.dirty_plates} 洗碗中={self.washing}  "
-            f"出餐口={self._pass_count()}/{cfg.pass_capacity}  "
-            f"灶台={len(self.stoves)}/{cfg.n_stoves}",
-            f"  厨师: {'忙(' + str(self.chef_busy) + ')' if self.chef_busy else '空闲'}   "
-            f"服务员: {'忙(' + str(self.server_busy) + ')' if self.server_busy else '空闲'}",
-        ]
-        sym = {DISH_PENDING: "待", DISH_COOKING: "做", DISH_READY: "出", DISH_DELIVERED: "上"}
-        for i, tb in enumerate(self.tables):
-            s = f"  桌{i}({tb.capacity}座): {TABLE_STATE_NAMES[tb.state]}"
-            if tb.group:
-                s += f" {tb.group.size}人 耐心={tb.group.patience:.1f}"
-                if tb.phase == PHASE_DESSERT:
-                    s += " [甜点]"
-            if tb.items:
-                s += " " + " ".join(f"{cfg.dishes[it.dish]['name']}({sym[it.status]})"
-                                    for it in tb.items)
-            if tb.plates:
-                s += f" 盘={tb.plates}"
-            lines.append(s)
+        snap = self.snapshot()
+        lines = [f"t={snap['t']:3d}  clean plates={snap['clean_plates']} "
+                 f"dirty={snap['sink_dirty']} returning={snap['returning_plates']}"]
+        for ag in snap["agents"]:
+            task = ag["task"]
+            tdesc = "idle" if task is None else f"{task['kind']}@{task['target']}"
+            lines.append(f"  {ag['name']}: at {ag['station']}, holding [{ag['holding'] or 'nothing'}], {tdesc}")
+        for name, it in snap["counters"].items():
+            if it:
+                lines.append(f"  {name}: {it}")
+        for name, c in snap["cookers"].items():
+            if c["status"] != "empty":
+                extra = f" ({c['remaining']} left)" if c["status"] == "cooking" else ""
+                lines.append(f"  {name}: {c['status']} {', '.join(c['contents'])}{extra}")
+        for o in snap["open_orders"]:
+            dishes = " ".join(f"{k} x{v}" for k, v in o["remaining"].items())
+            lines.append(f"  order {o['id']} due {o['deadline_t']}: {dishes}")
         return "\n".join(lines)

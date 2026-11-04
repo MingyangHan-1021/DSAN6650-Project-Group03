@@ -1,0 +1,51 @@
+{
+  "ingredients": {
+    "lettuce": "lettuce",
+    "tomato": "tomato",
+    "beef": "beef",
+    "bun": "bun",
+    "noodles": "noodles",
+    "dough": "dough",
+    "cheese": "cheese",
+    "tomato_soup": "tomato soup",
+    "pizza": "pizza"
+  },
+  "products": ["tomato_soup", "pizza"],
+  "state_names": {
+    "raw": "",
+    "chopped": "chopped",
+    "fried": "fried",
+    "boiled": "boiled",
+    "cooked": "cooked",
+    "baked": "baked"
+  },
+  "processes": {
+    "chop": {
+      "station": "cutting_board",
+      "map": {
+        "lettuce:raw": "lettuce:chopped",
+        "tomato:raw": "tomato:chopped",
+        "cheese:raw": "cheese:chopped"
+      }
+    },
+    "fry": {
+      "station": "pan",
+      "map": {
+        "beef:raw": "beef:fried",
+        "tomato:chopped": "tomato:fried"
+      }
+    }
+  },
+  "cookers": [
+    {"tool": "pot",  "inputs": ["tomato:chopped", "tomato:chopped"], "output": "tomato_soup:cooked", "time": 6},
+    {"tool": "pot",  "inputs": ["noodles:raw"], "output": "noodles:boiled", "time": 5},
+    {"tool": "oven", "inputs": ["dough:raw", "tomato:chopped", "cheese:chopped"], "output": "pizza:baked", "time": 8}
+  ],
+  "dishes": {
+    "salad":       {"name": "Salad",        "components": ["lettuce:chopped", "tomato:chopped"], "price": 10},
+    "tomato_soup": {"name": "Tomato Soup",  "components": ["tomato_soup:cooked"], "price": 12},
+    "burger":      {"name": "Burger",       "components": ["beef:fried", "lettuce:chopped", "bun:raw"], "price": 16},
+    "pasta":       {"name": "Tomato Pasta", "components": ["noodles:boiled", "tomato:fried"], "price": 18},
+    "pizza":       {"name": "Pizza",        "components": ["pizza:baked"], "price": 20}
+  }
+}
