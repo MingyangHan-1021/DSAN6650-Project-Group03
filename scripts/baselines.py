@@ -1,0 +1,828 @@
+"""
+Baseline policies for the cooperative kitchen.
+
+Two policies:
+
+- random: each agent picks a uniformly random legal action (lower bound).
+- rule:   a hand-written scheduler that turns the recipes into task chains and lets
+          the two agents pick tasks off a shared list (see below).
+
+The rule policy is also the difficulty calibration tool: if it cannot complete a
+reasonable number of orders on medium, the difficulty parameters are wrong and the
+config has to be fixed before anyone starts training RL.
+
+How the rule policy works
+-------------------------
+The environment has no "combine" action: an agent walks to a station and the
+interaction follows from what it holds, so one action = "go there and do it",
+travel included. A dish is therefore a short sequence of station visits, and the
+policy plans those sequences (a *task*) and hands them out:
+
+  prep     burger: [beef_bin -> pan -> counter]     [lettuce_bin -> board -> counter]
+  assemble burger: [plate_rack -> bun_bin -> counter(beef) -> counter(lettuce) -> park]
+  serve    burger: [counter(complete plate) -> pass]
+
+Rules on top of the chains:
+
+* Two plans at a time, for the dishes whose deadlines are closest. The second plan
+  lets the agents keep working while a pot or the oven is cooking.
+* A plate is only taken when every component of the dish is already on a counter,
+  straight in a bin (the burger bun), or finished in a cooker. Taking one earlier
+  ties up one of the six plates and makes cookers burn uncollected.
+* Plating and serving are separate tasks, so the split kitchen works too: there the
+  assistant assembles on a counter and the chef carries the plate to the pass.
+* Cookers are allocated per plan (both tomatoes of a soup go into the same pot) and
+  a finished cooker outranks everything, because it burns after `burn_after` steps.
+* A task is only claimed by an agent that may use every station in it, and the second
+  agent never picks the station the first one just chose (the environment drops that
+  action, which would otherwise leave the loser stuck forever).
+* Every action is checked against its expected post-condition before the task moves
+  on (did the take really put something in the hand?). If it failed, the chain
+  restarts from the bin, or the item in hand is parked, so nobody deadlocks holding
+  something half-way through a recipe.
+
+Usage (from the project root)
+-----------------------------
+    # one episode, print the state every 10 steps
+    python scripts/baselines.py --policy rule --config configs/env/medium.yaml --seeds 0 --trace 10
+
+    # the calibration table: 20 seeds x 3 difficulties
+    python scripts/baselines.py --policy rule --config configs/env/easy.yaml \
+        configs/env/medium.yaml configs/env/hard.yaml --seeds 0-19 \
+        --out results/csv/baselines_rule.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import statistics
+import sys
+from collections import Counter
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from restaurant_env import KitchenConfig, KitchenCore  # noqa: E402
+from restaurant_env.core import C_BURNT, C_COOKING, C_DONE, C_EMPTY, C_FILLING  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Small recipe helpers
+# ---------------------------------------------------------------------------
+def _cooker_recipe_for(book, output):
+    """The cooker recipe that produces `output`, or None."""
+    for r in book.cookers:
+        if r["output"] == output:
+            return r
+    return None
+
+
+def _process_for(book, comp):
+    """(station kind, source component) of the process that produces `comp`."""
+    for kind, (_pname, mapping) in book.processes.items():
+        for src, out in mapping.items():
+            if out == comp:
+                return kind, src
+    return None, None
+
+
+# post-conditions of a step: what the agent must hold once the action is done
+EMPTY = ("empty",)
+PLATE = ("plate",)
+ANY = ("any",)
+
+
+def holds(comp):
+    return ("comp", comp)
+
+
+def plate_has(comp):
+    return ("plate_has", comp)
+
+
+# ---------------------------------------------------------------------------
+# Tasks and plans
+# ---------------------------------------------------------------------------
+class Task:
+    """A chain of station visits.
+
+    Each step is (kind, payload, expected interaction, post-condition).
+    """
+
+    __slots__ = ("steps", "i", "agent", "label", "waited", "fails", "blocked_by")
+
+    def __init__(self, steps, label="", blocked_by=None):
+        self.steps = steps
+        self.i = 0
+        self.agent = None
+        self.label = label
+        self.blocked_by = blocked_by or []
+        self.waited = 0        # consecutive steps this task could not start
+        self.fails = 0         # how often an action of this task was rejected
+
+    @property
+    def done(self):
+        return self.i >= len(self.steps)
+
+    @property
+    def step(self):
+        return self.steps[self.i]
+
+
+class Plan:
+    """Everything needed to serve one dish: prep tasks, the plate, and the serving."""
+
+    def __init__(self, dish: str, deadline: int):
+        self.dish = dish
+        self.deadline = deadline
+        self.prep: list[Task] = []
+        self.assemble: Task | None = None
+        self.serve: Task | None = None
+        self.cooker_kind = None     # "pot" / "oven" / None
+        self.cooker_recipe = None
+        self.cooker = None          # station index once allocated
+
+    def tasks(self):
+        return self.prep + [self.assemble, self.serve]
+
+    def abandoned(self):
+        return all(t.agent is None for t in self.tasks())
+
+
+class RulePolicy:
+    """Recipe-driven task scheduler (see the module docstring)."""
+
+    MAX_PLANS = 2
+    WAIT_LIMIT = 14         # steps a task may wait for a counter / cooker before replanning
+    FAIL_LIMIT = 3          # rejected actions before the plan is abandoned
+
+    def __init__(self, max_plans: int = 2):
+        self.MAX_PLANS = max_plans
+        self.plans: list[Plan] = []
+        self.task_of = [(None, None), (None, None)]   # (task, plan) per agent
+        self.pending = [None, None]                   # (task, plan, step index) issued
+
+    # -- public ----------------------------------------------------------
+    def act(self, core: KitchenCore):
+        self._sync_plans(core)
+        acts = [0, 0]
+        taken = set()
+        for a in (0, 1):
+            if core.task[a] is not None:       # busy: the mask only allows 0 anyway
+                continue
+            if self.pending[a] is not None:    # the previous action just finished
+                self._verify(core, a)
+            acts[a] = self._act_agent(core, a, taken)
+            if acts[a] > 0:
+                taken.add(acts[a] - 1)
+        return acts
+
+    # ------------------------------------------------------------------
+    # Planning
+    # ------------------------------------------------------------------
+    def _needs(self, core):
+        """dish -> copies still to deliver, plus the closest deadline of each dish."""
+        book = core.book
+        need, deadline = Counter(), {}
+        for order in core.open_orders:
+            for dish, n in order.remaining.items():
+                need[dish] += n
+                deadline[dish] = min(deadline.get(dish, 10 ** 9), order.deadline_t)
+        # a plate that already holds a complete dish will be served: it covers one
+        for it in core.holding:
+            if it is not None and it.kind == "plate":
+                dish = book.dish_of(it.contents)
+                if dish is not None and need[dish] > 0:
+                    need[dish] -= 1
+        for it in core.counter.values():
+            if it is not None and it.kind == "plate":
+                dish = book.dish_of(it.contents)
+                if dish is not None and need[dish] > 0:
+                    need[dish] -= 1
+        # a cooker that is already cooking (or done) covers the dish it produces
+        for c in core.cookers.values():
+            if c.status in (C_COOKING, C_DONE) and c.output:
+                for dish, data in book.dishes.items():
+                    if c.output in data["components"]:
+                        if need[dish] > 0:
+                            need[dish] -= 1
+                        break
+        return Counter({d: n for d, n in need.items() if n > 0}), deadline
+
+    @staticmethod
+    def _plate_on_counter(core, dish):
+        for it in core.counter.values():
+            if it is not None and it.kind == "plate" and core.book.dish_of(it.contents) == dish:
+                return True
+        return False
+
+    def _sync_plans(self, core):
+        need, deadline = self._needs(core)
+        # a plan lives until served; also while an agent is inside it or while a
+        # finished plate for it waits on a counter (otherwise nobody serves it)
+        self.plans = [p for p in self.plans
+                      if not p.serve.done
+                      and (p.dish in need or self._plate_on_counter(core, p.dish)
+                           or any(t.agent is not None for t in p.tasks()))]
+        for p in self.plans:
+            self._allocate_cooker(core, p)
+
+        active = [p for p in self.plans if not p.serve.done]
+        planned = {p.dish for p in active}
+        for dish in sorted(need, key=lambda d: deadline.get(d, 10 ** 9)):
+            if len(active) >= self.MAX_PLANS:
+                break
+            if dish in planned:
+                continue
+            plan = self._build_plan(core, dish, deadline.get(dish, core.t + 300))
+            self.plans.append(plan)
+            active.append(plan)
+            planned.add(dish)
+        self.plans.sort(key=lambda p: p.deadline)
+
+    def _allocate_cooker(self, core, plan) -> bool:
+        if plan.cooker_kind is None or plan.cooker is not None:
+            return True
+        recipe = plan.cooker_recipe
+        empty, resumable = [], []
+        for s, kind in enumerate(core.layout.kinds):
+            if kind != plan.cooker_kind:
+                continue
+            c = core.cookers[s]
+            if c.status == C_EMPTY:
+                empty.append(s)
+            elif c.status == C_FILLING and recipe is not None:
+                have = Counter(c.contents)
+                if all(recipe["_inputs"][x] >= n for x, n in have.items()):
+                    resumable.append((len(c.contents), s))
+        if empty:
+            plan.cooker = empty[0]
+            return True
+        if resumable:
+            plan.cooker = max(resumable)[1]     # finish the pot somebody left half full
+            return True
+        return False
+
+    def _build_plan(self, core, dish: str, deadline: int) -> Plan:
+        book, L = core.book, core.layout
+        plan = Plan(dish, deadline)
+        comps = book.dish_counters[dish]
+
+        cooker = None
+        for comp in comps:
+            recipe = _cooker_recipe_for(book, comp)
+            if recipe is not None:
+                cooker = (comp, recipe, comps[comp])
+                break
+        if cooker is not None:
+            _comp, recipe, n = cooker
+            plan.cooker_kind = recipe["tool"]
+            plan.cooker_recipe = recipe
+            for _ in range(n):
+                for inp, m in recipe["_inputs"].items():
+                    for _ in range(m):
+                        plan.prep.extend(self._prep_tasks(
+                            book, L, inp, ("cooker_fill", None, "cooker_add", EMPTY),
+                            f"{dish}: prep {inp}"))
+
+        for comp in comps:
+            if _cooker_recipe_for(book, comp) is not None:
+                continue
+            if self._bin_addable(book, comp):
+                continue                     # straight from the bin onto the plate
+            for _ in range(comps[comp]):
+                plan.prep.extend(self._prep_tasks(
+                    book, L, comp, ("free_counter", None, "place", EMPTY),
+                    f"{dish}: prep {comp}"))
+
+        steps = [("plate_any", None, ("take_plate", "pick"), PLATE)]
+        for comp in comps:
+            if _cooker_recipe_for(book, comp) is not None:
+                steps.append(("cooker_with", comp, "cooker_collect", plate_has(comp)))
+            elif self._bin_addable(book, comp):
+                steps.append(("st", self._bin_name(L, comp.split(":")[0]), "add_to_plate", plate_has(comp)))
+            else:
+                steps.append(("counter_with", comp, "plate_from_counter", plate_has(comp)))
+        steps.append(("free_counter", None, "place", EMPTY))   # park the finished plate
+        plan.assemble = Task(steps, label=f"{dish}: assemble")
+        plan.serve = Task([("dish_plate", dish, "pick", PLATE),
+                           ("st", "pass", "deliver", EMPTY)], label=f"{dish}: serve")
+        return plan
+
+    def _step_allowed(self, L, a, step) -> bool:
+        """Can agent `a` perform this step (ignoring whether it is legal right now)?"""
+        kind, payload = step[0], step[1]
+        if kind == "st":
+            s = L.id.get(payload)
+            return s is not None and L.allowed[a][s]
+        if kind in ("free_counter", "counter_with", "dish_plate", "plate_any"):
+            return any(L.allowed[a][s] for s in self._counter_ids(L))
+        if kind in ("cooker_fill", "cooker_with"):
+            for s, k in enumerate(L.kinds):
+                if k in ("pot", "oven") and L.allowed[a][s]:
+                    return True
+            return False
+        return True
+
+    @staticmethod
+    def _counter_ids(L):
+        return [s for s, k in enumerate(L.kinds) if k == "counter"]
+
+    def _prep_tasks(self, book, L, comp, end, label):
+        """Build the prep task(s) for one component.
+
+        In the split kitchen a single agent cannot walk the whole chain (the assistant
+        may use the bins and the board, the chef the pan and the cookers), so the chain
+        is cut at the zone boundary and the food is handed over on a counter:
+
+            assistant: [tomato_bin -> cutting_board -> counter]
+            chef:      [counter -> pan -> counter]
+        """
+        steps = self._prep_steps(book, L, comp, end)
+        runs, cur, owner = [], [], None
+        for step in steps:
+            allowed = [a for a in (0, 1) if self._step_allowed(L, a, step)]
+            if not allowed:
+                allowed = [owner if owner is not None else 0]
+            new_owner = owner if owner in allowed else allowed[0]
+            if owner is not None and new_owner != owner and cur:
+                carried = cur[-1][3][1] if cur[-1][3][0] == "comp" else None
+                if carried is not None:
+                    cur.append(("free_counter", None, "place", EMPTY))
+                    runs.append(cur)
+                    cur = [("counter_with", carried, "pick", holds(carried))]
+            owner = new_owner
+            cur.append(step)
+        if cur:
+            runs.append(cur)
+        tasks, prev = [], None
+        for run in runs:
+            task = Task(run, label=label, blocked_by=[prev] if prev is not None else None)
+            tasks.append(task)
+            prev = task
+        return tasks
+
+    def _prep_steps(self, book, L, comp: str, end) -> list:
+        """Steps that turn an empty hand into `comp` delivered to `end`."""
+        chain, cur = [], comp
+        while True:
+            kind, src = _process_for(book, cur)
+            if kind is None:
+                break
+            chain.append((self._station_of_kind(L, kind), book.processes[kind][0], cur))
+            cur = src
+        steps = [("st", self._bin_name(L, cur.split(":")[0]), "take", holds(cur))]
+        for station, pname, out in reversed(chain):
+            steps.append(("st", station, pname, holds(out)))
+        steps.append(end)
+        return steps
+
+    def _bin_addable(self, book, comp: str) -> bool:
+        """A raw ingredient that can go straight onto the plate (e.g. the burger bun)."""
+        if not comp.endswith(":raw"):
+            return False
+        return book.can_dispense(comp.split(":")[0]) and book.plate_valid([comp])
+
+    @staticmethod
+    def _bin_name(L, ingredient: str) -> str:
+        for s, kind in enumerate(L.kinds):
+            if kind == "dispenser" and L.stations[s].get("ingredient") == ingredient:
+                return L.names[s]
+        raise KeyError(f"no bin for {ingredient}")
+
+    @staticmethod
+    def _station_of_kind(L, kind: str) -> str:
+        return L.names[L.first_of(kind)]
+
+    # ------------------------------------------------------------------
+    # Running a task
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _counters(core):
+        return [s for s, k in enumerate(core.layout.kinds) if k == "counter"]
+
+    def _resolve(self, core, a, plan, step):
+        """Which station this step means right now, or None if it has to wait."""
+        L = core.layout
+        kind, payload = step[0], step[1]
+        if kind == "st":
+            s = L.id.get(payload)
+            return s if s is not None and L.allowed[a][s] else None
+        if kind == "free_counter":
+            for s in self._counters(core):
+                if core.counter[s] is None and L.allowed[a][s]:
+                    return s
+            return None
+        if kind == "counter_with":
+            for s in self._counters(core):
+                it = core.counter[s]
+                if it is not None and it.kind == "food" and it.comp == payload:
+                    return s
+            return None
+        if kind == "plate_any":
+            for s in self._counters(core):
+                it = core.counter[s]
+                if it is not None and it.kind == "plate" and not it.contents and L.allowed[a][s]:
+                    return s
+            s = L.id.get("plate_rack")
+            return s if s is not None and core.clean_plates > 0 else None
+        if kind == "dish_plate":
+            for s in self._counters(core):
+                it = core.counter[s]
+                if it is not None and it.kind == "plate" and core.book.dish_of(it.contents) == payload:
+                    return s
+            return None
+        if kind == "cooker_with":
+            for s, c in core.cookers.items():
+                if c.status == C_DONE and c.output == payload and L.allowed[a][s]:
+                    return s
+            return None
+        if kind == "cooker_fill":
+            return plan.cooker
+        return None
+
+    def _step_action(self, core, a, plan, task, taken):
+        """1-based action, None if the step is impossible, -1 if it has to wait."""
+        s = self._resolve(core, a, plan, task.step)
+        if s is None or s in taken:
+            return -1
+        if not core.action_mask(a)[s + 1]:
+            return -1          # the other agent is walking to / working at this station
+        now = core._plan(a, s)
+        if now is None:
+            return None
+        expected = task.step[2]
+        if expected is not None:
+            allowed = expected if isinstance(expected, tuple) else (expected,)
+            if now[0] not in allowed:
+                return None
+        return s + 1
+
+    @staticmethod
+    def _post_ok(core, a, post) -> bool:
+        h = core.holding[a]
+        if post[0] == "empty":
+            return h is None
+        if post[0] == "plate":
+            return h is not None and h.kind == "plate"
+        if post[0] == "plate_has":
+            return h is not None and h.kind == "plate" and post[1] in h.contents
+        if post[0] == "comp":
+            return h is not None and h.kind == "food" and h.comp == post[1]
+        return True
+
+    def _verify(self, core, a):
+        """Did the action we issued actually do what the step promised?"""
+        task, plan, i = self.pending[a]
+        self.pending[a] = None
+        if self._post_ok(core, a, task.steps[i][3]):
+            task.i = i + 1
+            task.waited = 0
+            if task.done:
+                task.agent = None
+                self.task_of[a] = (None, None)
+            return
+        # the action failed: restart the chain if the hands are empty, otherwise
+        # park the item and give the task back
+        task.agent = None
+        self.task_of[a] = (None, None)
+        task.fails += 1
+        if task.fails > self.FAIL_LIMIT:
+            self._abandon(plan)
+        elif core.holding[a] is None and i > 0:
+            task.i = 0
+
+    def _abandon(self, plan):
+        """Give up on a plan (a burnt cooker, a lost plate) so a fresh one can start."""
+        if plan is None:
+            return
+        for t in plan.tasks():
+            t.i = len(t.steps)
+            t.agent = None
+        if plan in self.plans:
+            self.plans.remove(plan)
+        for a in (0, 1):
+            task, _plan = self.task_of[a]
+            if task is not None and _plan is plan:
+                self.task_of[a] = (None, None)
+                self.pending[a] = None
+
+    def _act_agent(self, core, a, taken) -> int:
+        task, plan = self.task_of[a]
+        if task is not None and task.done:
+            task.agent = None
+            self.task_of[a] = (None, None)
+            task, plan = None, None
+        if task is not None:
+            act = self._step_action(core, a, plan, task, taken)
+            if act == -1:
+                task.waited += 1
+                if task.waited > self.WAIT_LIMIT:     # hopeless: rebuild the plan
+                    self._abandon(plan)
+                    return self._fallback(core, a)
+                return 0
+            if act is None:
+                task.waited += 1
+                if task.waited > self.WAIT_LIMIT:
+                    self._abandon(plan)
+                    return self._fallback(core, a)
+                self._drop(core, a, task, plan)
+                return self._fallback(core, a)
+            task.waited = 0
+            self.pending[a] = (task, plan, task.i)
+            return act
+
+        task, plan = self._pick_task(core, a)
+        if task is None:
+            return self._fallback(core, a)
+        act = self._step_action(core, a, plan, task, taken)
+        if act == -1:
+            return 0
+        if act is None:
+            return self._fallback(core, a)
+        task.agent = a
+        task.waited = 0
+        self.task_of[a] = (task, plan)
+        self.pending[a] = (task, plan, task.i)
+        return act
+
+    def _drop(self, core, a, task, plan):
+        task.agent = None
+        self.task_of[a] = (None, None)
+        self.pending[a] = None
+        if core.holding[a] is None and task.i > 0:
+            task.i = 0                          # redo it from the bin
+        task.fails += 1
+        if task.fails > self.FAIL_LIMIT:
+            self._abandon(plan)
+
+    # ------------------------------------------------------------------
+    # Choosing what to do next
+    # ------------------------------------------------------------------
+    def _can_do(self, core, a, task, plan) -> bool:
+        """Can this agent use every station this task visits?"""
+        L = core.layout
+        for kind, payload, _expected, _post in task.steps:
+            if kind == "st":
+                s = L.id.get(payload)
+                if s is None or not L.allowed[a][s]:
+                    return False
+            elif kind == "cooker_fill":
+                if plan is None or plan.cooker is None or not L.allowed[a][plan.cooker]:
+                    return False
+        return True
+
+    def _claimable(self, core, a, plan, task) -> bool:
+        return (task is not None and not task.done and task.agent is None
+                and all(t.done for t in task.blocked_by)
+                and self._can_do(core, a, task, plan))
+
+    def _pick_task(self, core, a):
+        # 1. a finished cooker outranks everything (it burns), and an almost finished
+        #    one is worth waiting next to with a plate in hand: walking to the rack and
+        #    back after it is done usually takes longer than `burn_after`
+        for plan in self.plans:
+            if plan.cooker is None:
+                continue
+            c = core.cookers[plan.cooker]
+            soon = c.status == C_COOKING and c.remaining <= 4
+            if (c.status == C_DONE or soon) and core.holding[a] is None:
+                if self._claimable(core, a, plan, plan.assemble) and core.clean_plates > 0:
+                    return plan.assemble, plan
+        # 2. a complete plate waiting on a counter should be served
+        for plan in self.plans:
+            if core.holding[a] is None and self._claimable(core, a, plan, plan.serve):
+                if self._resolve(core, a, plan, plan.serve.step) is not None:
+                    return plan.serve, plan
+        # 3. a burnt cooker is useless until it is cleaned
+        if core.holding[a] is None:
+            for s, c in core.cookers.items():
+                if c.status == C_BURNT and core.layout.allowed[a][s]:
+                    return Task([("st", core.layout.names[s], "cooker_clean", EMPTY)],
+                                label="clean"), None
+        # 4. no clean plates and dirty ones waiting -> wash
+        if core.clean_plates <= 1 and core.sink_dirty > 0 and core.holding[a] is None:
+            s = core.layout.id["sink"]
+            if core.layout.allowed[a][s]:
+                return Task([("st", "sink", "wash", EMPTY)], label="wash"), None
+        # 5. plate a dish whose components are all available
+        for plan in self.plans:
+            if core.holding[a] is None and core.clean_plates > 0 \
+                    and self._claimable(core, a, plan, plan.assemble) and self._ready(core, plan.dish):
+                return plan.assemble, plan
+        # 6. prep work, earliest deadline first
+        for plan in self.plans:
+            self._skip_satisfied_preps(core, plan)
+            for task in plan.prep:
+                if self._claimable(core, a, plan, task):
+                    return task, plan
+        return None, None
+
+    @staticmethod
+    def _task_comp(task):
+        """The component a prep task produces (the step before the drop-off)."""
+        post = task.steps[-2][3] if len(task.steps) >= 2 else task.steps[-1][3]
+        return post[1] if post[0] == "comp" else None
+
+    def _skip_satisfied_preps(self, core, plan):
+        """Mark prep tasks done when the component is already on a counter / in the cooker."""
+        on_counter = Counter()
+        for s in self._counters(core):
+            it = core.counter[s]
+            if it is not None and it.kind == "food":
+                on_counter[it.comp] += 1
+        in_cooker = Counter(plan.cooker_recipe["_inputs"]) if False else Counter()
+        if plan.cooker is not None:
+            in_cooker = Counter(core.cookers[plan.cooker].contents)
+        for task in plan.prep:
+            if task.done:
+                continue
+            comp = self._task_comp(task)
+            if comp is None:
+                continue
+            if on_counter[comp] > 0:
+                on_counter[comp] -= 1
+                task.i = len(task.steps)
+                task.agent = None
+            elif task.steps[-1][0] == "cooker_fill" and in_cooker[comp] > 0:
+                in_cooker[comp] -= 1
+                task.i = len(task.steps)
+                task.agent = None
+
+    def _ready(self, core, dish: str) -> bool:
+        """Can the dish be plated right now with what is already available?"""
+        book = core.book
+        avail = Counter()
+        for s in self._counters(core):
+            it = core.counter[s]
+            if it is not None and it.kind == "food":
+                avail[it.comp] += 1
+        for comp, k in book.dish_counters[dish].items():
+            short = k - avail[comp]
+            if short <= 0:
+                continue
+            if comp.endswith(":raw") and book.can_dispense(comp.split(":")[0]):
+                continue
+            done = sum(1 for c in core.cookers.values() if c.status == C_DONE and c.output == comp)
+            if done >= short:
+                continue
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Fallbacks: never stand still holding something
+    # ------------------------------------------------------------------
+    def _fallback(self, core, a) -> int:
+        h = core.holding[a]
+        L = core.layout
+        if h is not None and h.kind == "plate":
+            dish = core.book.dish_of(h.contents)
+            if dish is not None and any(o.remaining[dish] > 0 for o in core.open_orders):
+                if core._plan(a, L.id["pass"]) is not None:
+                    return L.id["pass"] + 1
+            for s in self._counters(core):
+                if core.counter[s] is None and core._plan(a, s) is not None:
+                    return s + 1
+            return L.id["trash"] + 1 if core._plan(a, L.id["trash"]) is not None else 0
+        if h is not None:
+            for s in self._counters(core):
+                if core.counter[s] is None and core._plan(a, s) is not None:
+                    return s + 1
+            return L.id["trash"] + 1 if core._plan(a, L.id["trash"]) is not None else 0
+        if core.clean_plates <= 1 and core.sink_dirty > 0 and core._plan(a, L.id["sink"]) is not None:
+            return L.id["sink"] + 1
+        for s, c in core.cookers.items():
+            if c.status == C_BURNT and core._plan(a, s) is not None:
+                return s + 1
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Random policy
+# ---------------------------------------------------------------------------
+class RandomPolicy:
+    def __init__(self, seed: int = 0):
+        self.rng = np.random.default_rng(seed)
+
+    def act(self, core: KitchenCore):
+        return [int(self.rng.choice(np.flatnonzero(core.action_mask(a)))) for a in (0, 1)]
+
+
+# ---------------------------------------------------------------------------
+# Running and reporting
+# ---------------------------------------------------------------------------
+def run_episode(core: KitchenCore, policy, seed: int, trace: int = 0):
+    core.reset(seed)
+    total, step, done = 0.0, 0, False
+    info = {}
+    while not done:
+        actions = policy.act(core)
+        _, reward, _, done, info = core.step(actions)
+        total += reward
+        step += 1
+        if trace and step % trace == 0:
+            print(f"\n--- step {step} | reward {total:.1f} ---")
+            print(core.render_text())
+    return total, info
+
+
+def flat_info(info: dict) -> dict:
+    out = {}
+    for k, v in info.items():
+        if k in ("events", "log"):
+            continue
+        out[k] = json.dumps(v) if isinstance(v, dict) else v
+    return out
+
+
+def summarize(rows, config_name: str):
+    def col(name):
+        return [r[name] for r in rows if r["config"] == config_name]
+
+    def mean(name):
+        v = col(name)
+        return statistics.fmean(v) if v else float("nan")
+
+    def sd(name):
+        v = col(name)
+        return statistics.pstdev(v) if len(v) > 1 else 0.0
+
+    print(f"\n{config_name}  ({len(col('seed'))} seeds, {rows[0]['policy']})")
+    print(f"  orders completed : {mean('orders_completed'):6.2f}  +- {sd('orders_completed'):.2f}"
+          f"   (arrived {mean('orders_arrived'):.2f}, expired {mean('orders_expired'):.2f})")
+    print(f"  dishes delivered : {mean('dishes_delivered'):6.2f}")
+    print(f"  revenue          : {mean('revenue'):6.1f}  +- {sd('revenue'):.1f}")
+    print(f"  avg tip rate     : {mean('avg_tip_rate'):6.3f}")
+    print(f"  completion time  : {mean('avg_completion_time'):6.1f}")
+    print(f"  wasted / burnt   : {mean('wasted'):5.2f} / {mean('burnt'):5.2f}")
+    print(f"  handoffs / confl.: {mean('handoffs'):5.2f} / {mean('conflicts'):5.2f}")
+    print(f"  no clean plate   : {mean('no_clean_plate_steps'):5.1f} steps")
+    print(f"  idle steps a0/a1 : {mean('a0_idle_steps'):5.1f} / {mean('a1_idle_steps'):5.1f}")
+    print(f"  total reward     : {mean('total_reward'):7.2f}  +- {sd('total_reward'):.2f}")
+
+
+def parse_seeds(text: str):
+    seeds = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-")
+            seeds += list(range(int(lo), int(hi) + 1))
+        else:
+            seeds.append(int(part))
+    return seeds
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--policy", choices=["random", "rule"], default="rule")
+    p.add_argument("--config", nargs="+", default=["configs/env/medium.yaml"])
+    p.add_argument("--seeds", default="0-19", help='e.g. "0-19" or "0,1,2"')
+    p.add_argument("--out", default=None, help="CSV path; default results/csv/baselines_<policy>.csv")
+    p.add_argument("--trace", type=int, default=0, help="print the state every N steps (first seed only)")
+    p.add_argument("--tag", default="", help="free-form label stored in the CSV")
+    p.add_argument("--max-plans", type=int, default=2, help="how many dishes may be in flight")
+    args = p.parse_args()
+
+    seeds = parse_seeds(args.seeds)
+    out = args.out or f"results/csv/baselines_{args.policy}.csv"
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+
+    rows = []
+    for cfg_path in args.config:
+        name = os.path.splitext(os.path.basename(cfg_path))[0]
+        cfg = KitchenConfig.from_yaml(cfg_path)
+        for i, seed in enumerate(seeds):
+            core = KitchenCore(cfg)
+            policy = (RulePolicy(args.max_plans) if args.policy == "rule"
+                      else RandomPolicy(seed))
+            trace = args.trace if i == 0 else 0
+            total, info = run_episode(core, policy, seed, trace)
+            row = {"config": name, "policy": args.policy, "seed": seed,
+                   "total_reward": round(total, 4), "tag": args.tag}
+            row.update({k: (round(v, 4) if isinstance(v, float) else v)
+                        for k, v in flat_info(info).items()})
+            rows.append(row)
+            print(f"{name:8s} seed {seed:3d} | reward {total:7.2f} | completed "
+                  f"{info['orders_completed']:2d}/{info['orders_arrived']:2d} arrived, "
+                  f"{info['orders_expired']:2d} expired | dishes {info['dishes_delivered']:2d}")
+
+    keys = ["config", "policy", "seed", "tag", "total_reward"] + \
+           sorted({k for r in rows for k in r} - {"config", "policy", "seed", "tag", "total_reward"})
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nresults written to {out}")
+
+    for cfg_path in args.config:
+        summarize(rows, os.path.splitext(os.path.basename(cfg_path))[0])
+
+
+if __name__ == "__main__":
+    main()

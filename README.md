@@ -29,6 +29,40 @@ python scripts/generate_orders.py --config configs/env/medium.yaml --seeds 0 1 2
 python scripts/run_random.py --config configs/env/easy.yaml --out results/logs/random_easy
 ```
 
+## Baselines
+
+```bash
+# random legal actions (lower bound)
+python scripts/baselines.py --policy random --config configs/env/medium.yaml --seeds 0-19
+
+# hand-written rule policy: the "can this kitchen cook at all?" reference
+python scripts/baselines.py --policy rule --config configs/env/easy.yaml configs/env/medium.yaml \
+    configs/env/hard.yaml --seeds 0-19 --out results/csv/baselines_rule.csv
+```
+
+The rule policy is a recipe scheduler. It turns a dish into a chain of station visits
+(bin -> board / pan -> counter, then plate -> counters -> pass), keeps two dishes in
+flight, hands the chains out to the two agents, and passes food over a counter when the
+split kitchen stops one agent from finishing a chain. The module docstring of
+`scripts/baselines.py` lists the rules it follows.
+
+Seeds 0-19, `results/csv/baselines_rule.csv`:
+
+| | easy | medium | hard |
+|---|---|---|---|
+| orders completed | 3.30 +- 1.95 | 3.90 +- 1.84 | 0.75 +- 0.94 |
+| orders arrived | 7.20 | 13.45 | 18.20 |
+| dishes delivered | 4.40 | 5.85 | 2.05 |
+| revenue | 64.5 | 94.4 | 31.4 |
+| avg tip rate | 0.155 | 0.114 | 0.057 |
+| wasted / burnt | 0.00 / 0.10 | 0.65 / 0.30 | 2.25 / 1.20 |
+| handoffs | 4.30 | 7.10 | 10.35 |
+
+The random policy completes about 0 orders on every difficulty, so the environment is
+not solvable by chance. The rule policy is a lower reference, not an upper bound: it is
+still far from the "one dish every 15-18 steps" the parameters are designed for, so
+these numbers alone do not calibrate the three difficulty bands.
+
 ## Project structure
 
 ```
@@ -47,6 +81,7 @@ data/
     └── split.json       # split kitchen
 configs/env/             # easy / medium / hard
 scripts/
+├── baselines.py         # random and rule-based baselines
 ├── generate_orders.py   # generate order CSV files
 └── run_random.py        # run a random episode and save the logs
 tests/test_core.py       # rule tests
