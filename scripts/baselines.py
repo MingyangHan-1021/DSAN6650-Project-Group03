@@ -46,10 +46,10 @@ Usage (from the project root)
     # one episode, print the state every 10 steps
     python scripts/baselines.py --policy rule --config configs/env/medium.yaml --seeds 0 --trace 10
 
-    # the calibration table: 20 seeds x 3 difficulties
-    python scripts/baselines.py --policy rule --config configs/env/easy.yaml \
-        configs/env/medium.yaml configs/env/hard.yaml --seeds 0-19 \
-        --out results/csv/baselines_rule.csv
+    # the calibration table: both baselines, 20 seeds x 3 difficulties
+    python scripts/baselines.py --policy both --config configs/env/easy.yaml \
+        configs/env/medium.yaml configs/env/hard.yaml --seeds 0-19
+    # -> results/csv/baselines_random.csv, baselines_rule.csv, baselines_summary.csv
 """
 
 from __future__ import annotations
@@ -63,6 +63,7 @@ import sys
 from collections import Counter
 
 import numpy as np
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -159,8 +160,9 @@ class RulePolicy:
     WAIT_LIMIT = 14         # steps a task may wait for a counter / cooker before replanning
     FAIL_LIMIT = 3          # rejected actions before the plan is abandoned
 
-    def __init__(self, max_plans: int = 2):
+    def __init__(self, max_plans: int = 2, agents=(0, 1)):
         self.MAX_PLANS = max_plans
+        self.agents = tuple(agents)
         self.plans: list[Plan] = []
         self.task_of = [(None, None), (None, None)]   # (task, plan) per agent
         self.pending = [None, None]                   # (task, plan, step index) issued
@@ -171,6 +173,8 @@ class RulePolicy:
         acts = [0, 0]
         taken = set()
         for a in (0, 1):
+            if a not in self.agents:           # solo reference: one agent does everything
+                continue
             if core.task[a] is not None:       # busy: the mask only allows 0 anyway
                 continue
             if self.pending[a] is not None:    # the previous action just finished
@@ -716,6 +720,9 @@ class RandomPolicy:
 # ---------------------------------------------------------------------------
 def run_episode(core: KitchenCore, policy, seed: int, trace: int = 0):
     core.reset(seed)
+    # total demand of this episode: how many dishes the orders ask for
+    demand_dishes = sum(len(o.dishes) for o in core.future_orders) + \
+        sum(len(o.dishes) for o in core.open_orders)
     total, step, done = 0.0, 0, False
     info = {}
     while not done:
@@ -726,6 +733,7 @@ def run_episode(core: KitchenCore, policy, seed: int, trace: int = 0):
         if trace and step % trace == 0:
             print(f"\n--- step {step} | reward {total:.1f} ---")
             print(core.render_text())
+    info["demand_dishes"] = demand_dishes
     return total, info
 
 
@@ -738,30 +746,115 @@ def flat_info(info: dict) -> dict:
     return out
 
 
-def summarize(rows, config_name: str):
-    def col(name):
-        return [r[name] for r in rows if r["config"] == config_name]
+SUMMARY_METRICS = [
+    ("orders_arrived", "orders that arrived"),
+    ("orders_completed", "orders completed"),
+    ("orders_expired", "orders expired"),
+    ("demand_dishes", "dishes ordered"),
+    ("dishes_delivered", "dishes served"),
+    ("revenue", "revenue"),
+    ("avg_tip_rate", "average tip rate"),
+    ("avg_completion_time", "average completion time"),
+    ("wasted", "food thrown away"),
+    ("burnt", "burnt cookers"),
+    ("handoffs", "handoffs"),
+    ("conflicts", "conflicts"),
+    ("no_clean_plate_steps", "steps without a clean plate"),
+    ("a0_idle_steps", "agent 0 idle steps"),
+    ("a1_idle_steps", "agent 1 idle steps"),
+    ("total_reward", "episode reward"),
+]
 
-    def mean(name):
-        v = col(name)
-        return statistics.fmean(v) if v else float("nan")
 
-    def sd(name):
-        v = col(name)
-        return statistics.pstdev(v) if len(v) > 1 else 0.0
+def mean_sd(rows, config: str, policy: str, metric: str):
+    values = [float(r[metric]) for r in rows
+              if r["config"] == config and r["policy"] == policy]
+    if not values:
+        return float("nan"), 0.0
+    return statistics.fmean(values), (statistics.pstdev(values) if len(values) > 1 else 0.0)
 
-    print(f"\n{config_name}  ({len(col('seed'))} seeds, {rows[0]['policy']})")
-    print(f"  orders completed : {mean('orders_completed'):6.2f}  +- {sd('orders_completed'):.2f}"
-          f"   (arrived {mean('orders_arrived'):.2f}, expired {mean('orders_expired'):.2f})")
-    print(f"  dishes delivered : {mean('dishes_delivered'):6.2f}")
-    print(f"  revenue          : {mean('revenue'):6.1f}  +- {sd('revenue'):.1f}")
-    print(f"  avg tip rate     : {mean('avg_tip_rate'):6.3f}")
-    print(f"  completion time  : {mean('avg_completion_time'):6.1f}")
-    print(f"  wasted / burnt   : {mean('wasted'):5.2f} / {mean('burnt'):5.2f}")
-    print(f"  handoffs / confl.: {mean('handoffs'):5.2f} / {mean('conflicts'):5.2f}")
-    print(f"  no clean plate   : {mean('no_clean_plate_steps'):5.1f} steps")
-    print(f"  idle steps a0/a1 : {mean('a0_idle_steps'):5.1f} / {mean('a1_idle_steps'):5.1f}")
-    print(f"  total reward     : {mean('total_reward'):7.2f}  +- {sd('total_reward'):.2f}")
+
+def summarize(rows, config_name: str, policy: str):
+    n = sum(1 for r in rows if r["config"] == config_name and r["policy"] == policy)
+    print(f"\n{config_name} / {policy}  ({n} seeds)")
+    for metric, label in SUMMARY_METRICS:
+        m, sd = mean_sd(rows, config_name, policy, metric)
+        print(f"  {label:<30s} {m:8.2f}  +- {sd:6.2f}")
+
+
+def comparison_table(rows, configs, policies):
+    """One row per (config, policy) so the two baselines can be read side by side."""
+    head = (f"{'config':<8s}{'policy':<8s}{'completed':>12s}{'arrived':>9s}"
+            f"{'demand':>8s}{'served':>8s}{'revenue':>9s}{'tip':>7s}{'wasted':>8s}{'burnt':>7s}")
+    print("\n" + head)
+    print("-" * len(head))
+    for cfg in configs:
+        for pol in policies:
+            m, sd = mean_sd(rows, cfg, pol, "orders_completed")
+            if m != m:      # nan: policy was not run for this config
+                continue
+            arr, _ = mean_sd(rows, cfg, pol, "orders_arrived")
+            dem, _ = mean_sd(rows, cfg, pol, "demand_dishes")
+            dis, _ = mean_sd(rows, cfg, pol, "dishes_delivered")
+            rev, rev_sd = mean_sd(rows, cfg, pol, "revenue")
+            tip, _ = mean_sd(rows, cfg, pol, "avg_tip_rate")
+            was, _ = mean_sd(rows, cfg, pol, "wasted")
+            bur, _ = mean_sd(rows, cfg, pol, "burnt")
+            print(f"{cfg:<8s}{pol:<8s}{m:>7.2f}+-{sd:<4.2f}{arr:>9.2f}{dem:>8.2f}{dis:>8.2f}"
+                  f"{rev:>9.1f}{tip:>7.3f}{was:>8.2f}{bur:>7.2f}")
+
+
+def write_episodes(rows, path):
+    keys = ["config", "policy", "seed", "tag", "total_reward"] + \
+           sorted({k for r in rows for k in r} - {"config", "policy", "seed", "tag", "total_reward"})
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nper-episode results written to {path}")
+
+
+def write_summary(rows, path, configs, policies):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["config", "policy", "n_seeds", "metric", "mean", "std"])
+        for cfg in configs:
+            for pol in policies:
+                n = sum(1 for r in rows if r["config"] == cfg and r["policy"] == pol)
+                if n == 0:
+                    continue
+                for metric, _label in SUMMARY_METRICS:
+                    m, sd = mean_sd(rows, cfg, pol, metric)
+                    w.writerow([cfg, pol, n, metric, round(m, 4), round(sd, 4)])
+    print(f"summary written to {path}")
+
+
+def apply_overrides(cfg: KitchenConfig, overrides, arrival_scale: float = 1.0):
+    """Change a few parameters at run time, without editing configs/env.
+
+    `--override burn_after=12 --override orders.patience_min=130` are applied first,
+    then `--arrival-scale` multiplies the order arrival rate (schedule or constant).
+    """
+    for item in overrides or []:
+        key, _, raw = item.partition("=")
+        value = yaml.safe_load(raw)
+        *parents, leaf = key.strip().split(".")
+        node = cfg
+        for part in parents:
+            node = node[part] if isinstance(node, dict) else getattr(node, part)
+        if isinstance(node, dict):
+            node[leaf] = value
+        else:
+            setattr(node, leaf, value)
+    if arrival_scale != 1.0:
+        schedule = cfg.orders.get("arrival_schedule")
+        if schedule:
+            cfg.orders["arrival_schedule"] = [[t, r * arrival_scale] for t, r in schedule]
+        else:
+            cfg.orders["arrival_rate"] = cfg.orders["arrival_rate"] * arrival_scale
+    if overrides or arrival_scale != 1.0:
+        cfg.__post_init__()          # re-run the merge / assertion logic
+    return cfg
 
 
 def parse_seeds(text: str):
@@ -778,50 +871,78 @@ def parse_seeds(text: str):
     return seeds
 
 
+def output_paths(policy_arg: str, out: str | None):
+    """Where the per-policy CSVs go (one file per policy when both are run)."""
+    policies = ["random", "rule"] if policy_arg == "both" else [policy_arg]
+    if out is None:
+        return policies, {p: f"results/csv/baselines_{p}.csv" for p in policies}
+    if len(policies) == 1:
+        return policies, {policies[0]: out}
+    root, ext = os.path.splitext(out)
+    return policies, {p: f"{root}_{p}{ext or '.csv'}" for p in policies}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--policy", choices=["random", "rule"], default="rule")
+    p.add_argument("--policy", choices=["random", "rule", "both"], default="rule",
+                   help='"both" runs the random and the rule baseline on the same seeds')
     p.add_argument("--config", nargs="+", default=["configs/env/medium.yaml"])
     p.add_argument("--seeds", default="0-19", help='e.g. "0-19" or "0,1,2"')
-    p.add_argument("--out", default=None, help="CSV path; default results/csv/baselines_<policy>.csv")
+    p.add_argument("--out", default=None,
+                   help="CSV path; default results/csv/baselines_<policy>.csv "
+                        "(with --policy both the policy name is inserted before the extension)")
     p.add_argument("--trace", type=int, default=0, help="print the state every N steps (first seed only)")
     p.add_argument("--tag", default="", help="free-form label stored in the CSV")
     p.add_argument("--max-plans", type=int, default=2, help="how many dishes may be in flight")
+    p.add_argument("--override", action="append", default=[],
+                   help="runtime parameter override, e.g. --override burn_after=12")
+    p.add_argument("--arrival-scale", type=float, default=1.0,
+                   help="multiply the order arrival rate (difficulty experiment)")
+    p.add_argument("--solo", action="store_true",
+                   help="one agent does all the work (reference for what cooperation adds)")
     args = p.parse_args()
 
     seeds = parse_seeds(args.seeds)
-    out = args.out or f"results/csv/baselines_{args.policy}.csv"
-    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    configs = [os.path.splitext(os.path.basename(c))[0] + ("/solo" if args.solo else "")
+               for c in args.config]
+    policies, paths = output_paths(args.policy, args.out)
+    for path in paths.values():
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     rows = []
-    for cfg_path in args.config:
-        name = os.path.splitext(os.path.basename(cfg_path))[0]
-        cfg = KitchenConfig.from_yaml(cfg_path)
-        for i, seed in enumerate(seeds):
-            core = KitchenCore(cfg)
-            policy = (RulePolicy(args.max_plans) if args.policy == "rule"
-                      else RandomPolicy(seed))
-            trace = args.trace if i == 0 else 0
-            total, info = run_episode(core, policy, seed, trace)
-            row = {"config": name, "policy": args.policy, "seed": seed,
-                   "total_reward": round(total, 4), "tag": args.tag}
-            row.update({k: (round(v, 4) if isinstance(v, float) else v)
-                        for k, v in flat_info(info).items()})
-            rows.append(row)
-            print(f"{name:8s} seed {seed:3d} | reward {total:7.2f} | completed "
-                  f"{info['orders_completed']:2d}/{info['orders_arrived']:2d} arrived, "
-                  f"{info['orders_expired']:2d} expired | dishes {info['dishes_delivered']:2d}")
+    for policy_name in policies:
+        for cfg_path in args.config:
+            name = os.path.splitext(os.path.basename(cfg_path))[0] + ("/solo" if args.solo else "")
+            cfg = apply_overrides(KitchenConfig.from_yaml(cfg_path), args.override,
+                                  args.arrival_scale)
+            for i, seed in enumerate(seeds):
+                core = KitchenCore(cfg)
+                if policy_name == "rule":
+                    policy = RulePolicy(args.max_plans, agents=(0,) if args.solo else (0, 1))
+                else:
+                    policy = RandomPolicy(seed)
+                trace = args.trace if i == 0 and policy_name == "rule" else 0
+                total, info = run_episode(core, policy, seed, trace)
+                label = name
+                row = {"config": label, "policy": policy_name, "seed": seed,
+                       "total_reward": round(total, 4), "tag": args.tag}
+                row.update({k: (round(v, 4) if isinstance(v, float) else v)
+                            for k, v in flat_info(info).items()})
+                rows.append(row)
+                print(f"{name:8s} {policy_name:6s} seed {seed:3d} | reward {total:7.2f} | "
+                      f"completed {info['orders_completed']:2d}/{info['orders_arrived']:2d} arrived, "
+                      f"{info['orders_expired']:2d} expired | dishes {info['dishes_delivered']:2d}")
 
-    keys = ["config", "policy", "seed", "tag", "total_reward"] + \
-           sorted({k for r in rows for k in r} - {"config", "policy", "seed", "tag", "total_reward"})
-    with open(out, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(rows)
-    print(f"\nresults written to {out}")
+    for policy_name, path in paths.items():
+        write_episodes([r for r in rows if r["policy"] == policy_name], path)
+    summary_path = os.path.join(os.path.dirname(paths[policies[0]]) or ".", "baselines_summary.csv")
+    write_summary(rows, summary_path, configs, policies)
 
-    for cfg_path in args.config:
-        summarize(rows, os.path.splitext(os.path.basename(cfg_path))[0])
+    for name in configs:
+        for policy_name in policies:
+            summarize(rows, name, policy_name)
+    if len(policies) > 1:
+        comparison_table(rows, configs, policies)
 
 
 if __name__ == "__main__":
