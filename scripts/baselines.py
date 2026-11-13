@@ -16,30 +16,42 @@ How the rule policy works
 The environment has no "combine" action: an agent walks to a station and the
 interaction follows from what it holds, so one action = "go there and do it",
 travel included. A dish is therefore a short sequence of station visits, and the
-policy plans those sequences (a *task*) and hands them out:
+policy plans those sequences (a *task*) and hands them out. A plate is filled in one
+of two ways:
 
-  prep     burger: [beef_bin -> pan -> counter]     [lettuce_bin -> board -> counter]
-  assemble burger: [plate_rack -> bun_bin -> counter(beef) -> counter(lettuce) -> park]
-  serve    burger: [counter(complete plate) -> pass]
+park mode - dishes that need no cooker (salad, burger), open kitchen only
+  park   burger: [plate_rack -> free counter]
+  prep   burger: [beef_bin -> pan -> that counter]  [lettuce_bin -> board -> that counter]
+  serve  burger: [counter(complete plate) -> pass]
+  One counter for the whole dish, and no "put it down, walk back, pick it up again".
+
+hand mode - dishes whose plate has to collect from a pot or the oven (soup, pasta, pizza)
+  prep     soup: [tomato_bin -> board -> counter] x2  (and into the pot from there)
+  assemble soup: [plate_rack -> pot(collect) -> park]
+  serve    soup: [counter(complete plate) -> pass]
 
 Rules on top of the chains:
 
-* Two plans at a time, for the dishes whose deadlines are closest. The second plan
-  lets the agents keep working while a pot or the oven is cooking.
-* A plate is only taken when every component of the dish is already on a counter,
-  straight in a bin (the burger bun), or finished in a cooker. Taking one earlier
-  ties up one of the six plates and makes cookers burn uncollected.
+* Two plans at a time, for the dishes whose deadlines are closest. When one of them
+  needs a cooker, the second one is chosen among the dishes that do not, so the two
+  agents are not left watching the pot.
+* In hand mode a plate is only taken when every component is already on a counter,
+  straight in a bin (the burger bun), or finished in a cooker: taking one earlier
+  ties up one of the six plates.
 * Plating and serving are separate tasks, so the split kitchen works too: there the
   assistant assembles on a counter and the chef carries the plate to the pass.
-* Cookers are allocated per plan (both tomatoes of a soup go into the same pot) and
-  a finished cooker outranks everything, because it burns after `burn_after` steps.
+* Cookers are allocated per plan (both tomatoes of a soup go into the same pot) and a
+  plate is fetched while the pot is nearly done, because a finished cooker burns after
+  `burn_after` steps and "notice it, walk to the rack, walk to the pot" takes longer.
 * A task is only claimed by an agent that may use every station in it, and the second
   agent never picks the station the first one just chose (the environment drops that
   action, which would otherwise leave the loser stuck forever).
 * Every action is checked against its expected post-condition before the task moves
-  on (did the take really put something in the hand?). If it failed, the chain
-  restarts from the bin, or the item in hand is parked, so nobody deadlocks holding
-  something half-way through a recipe.
+  on (did the take really put something in the hand? did the component really end up
+  on the parked plate?). If it failed, the chain restarts from the bin, or the item in
+  hand is parked, so nobody deadlocks holding something half-way through a recipe.
+* A task that waits for a counter or a cooker for more than WAIT_LIMIT steps is
+  dropped and the whole plan is rebuilt.
 
 Usage (from the project root)
 -----------------------------
@@ -104,6 +116,11 @@ def plate_has(comp):
     return ("plate_has", comp)
 
 
+def parked_has(comp):
+    """The component is on the plate we parked on a counter (nobody holds that plate)."""
+    return ("parked_has", comp)
+
+
 # ---------------------------------------------------------------------------
 # Tasks and plans
 # ---------------------------------------------------------------------------
@@ -145,6 +162,8 @@ class Plan:
         self.cooker_kind = None     # "pot" / "oven" / None
         self.cooker_recipe = None
         self.cooker = None          # station index once allocated
+        self.mode = "hand"          # "park": plate on a counter, components go straight onto it
+        self.plate_counter = None   # counter the plate is parked on (mode == "park")
 
     def tasks(self):
         return self.prep + [self.assemble, self.serve]
@@ -236,7 +255,18 @@ class RulePolicy:
 
         active = [p for p in self.plans if not p.serve.done]
         planned = {p.dish for p in active}
-        for dish in sorted(need, key=lambda d: deadline.get(d, 10 ** 9)):
+        # While a cooker dish is in flight the agents would sit and watch the pot.
+        # Prefer a dish that needs no cooker as the second plan, so there is always
+        # something to do during the cooking time.
+        book = core.book
+        cooker_in_flight = any(p.cooker_kind is not None for p in active)
+
+        def needs_cooker(dish):
+            return any(_cooker_recipe_for(book, c) is not None for c in book.dish_counters[dish])
+
+        candidates = sorted(need, key=lambda d: ((cooker_in_flight and needs_cooker(d)),
+                                                 deadline.get(d, 10 ** 9)))
+        for dish in candidates:
             if len(active) >= self.MAX_PLANS:
                 break
             if dish in planned:
@@ -274,18 +304,41 @@ class RulePolicy:
         book, L = core.book, core.layout
         plan = Plan(dish, deadline)
         comps = book.dish_counters[dish]
+        has_cooker = any(_cooker_recipe_for(book, c) is not None for c in comps)
+        staged = [c for c in comps if not self._bin_addable(book, c)
+                  and _cooker_recipe_for(book, c) is None]
 
-        cooker = None
+        open_layout = all(L.allowed[0]) and all(L.allowed[1])
+        if open_layout and not has_cooker and staged:
+            # No cooker: park a plate on a counter and carry every component straight
+            # onto it. That uses one counter per dish instead of two and removes the
+            # "put it down on a counter, walk back later and pick it up" round trip.
+            plan.mode = "park"
+            park = Task([("st", "plate_rack", "take_plate", PLATE),
+                         ("park_plate", None, "place", EMPTY)], label=f"{dish}: park")
+            plan.prep.append(park)
+            for comp in comps:
+                for _ in range(comps[comp]):
+                    steps = self._prep_steps(book, L, comp,
+                                             ("our_plate_add", comp, "food_onto_plate",
+                                              parked_has(comp)))
+                    plan.prep.append(Task(steps, label=f"{dish}: prep {comp}", blocked_by=[park]))
+            plan.assemble = park
+            plan.serve = Task([("dish_plate", dish, "pick", PLATE),
+                               ("st", "pass", "deliver", EMPTY)],
+                              label=f"{dish}: serve",
+                              blocked_by=[t for t in plan.prep if t is not park])
+            return plan
+
+        # Cooker dish: the plate travels with an agent (it has to collect from the
+        # pot / oven), so components are staged on counters first.
         for comp in comps:
             recipe = _cooker_recipe_for(book, comp)
-            if recipe is not None:
-                cooker = (comp, recipe, comps[comp])
-                break
-        if cooker is not None:
-            _comp, recipe, n = cooker
+            if recipe is None:
+                continue
             plan.cooker_kind = recipe["tool"]
             plan.cooker_recipe = recipe
-            for _ in range(n):
+            for _ in range(comps[comp]):
                 for inp, m in recipe["_inputs"].items():
                     for _ in range(m):
                         plan.prep.extend(self._prep_tasks(
@@ -322,7 +375,8 @@ class RulePolicy:
         if kind == "st":
             s = L.id.get(payload)
             return s is not None and L.allowed[a][s]
-        if kind in ("free_counter", "counter_with", "dish_plate", "plate_any"):
+        if kind in ("free_counter", "counter_with", "dish_plate", "plate_any",
+                    "park_plate", "our_plate_add"):
             return any(L.allowed[a][s] for s in self._counter_ids(L))
         if kind in ("cooker_fill", "cooker_with"):
             for s, k in enumerate(L.kinds):
@@ -416,16 +470,30 @@ class RulePolicy:
             s = L.id.get(payload)
             return s if s is not None and L.allowed[a][s] else None
         if kind == "free_counter":
-            for s in self._counters(core):
-                if core.counter[s] is None and L.allowed[a][s]:
-                    return s
-            return None
+            free = [s for s in self._counters(core)
+                    if core.counter[s] is None and L.allowed[a][s]]
+            if not free:
+                return None
+            # the closest free counter: a placement is a pure detour otherwise
+            speed = core.cfg.agents[a]["move_speed"]
+            return min(free, key=lambda s: L.travel_time(core.pos[a], s, speed))
         if kind == "counter_with":
             for s in self._counters(core):
                 it = core.counter[s]
                 if it is not None and it.kind == "food" and it.comp == payload:
                     return s
             return None
+        if kind == "park_plate":
+            for s in self._counters(core):
+                if core.counter[s] is None and L.allowed[a][s]:
+                    return s
+            return None
+        if kind == "our_plate_add":
+            s = plan.plate_counter
+            if s is None:
+                return None
+            it = core.counter[s]
+            return s if it is not None and it.kind == "plate" else None
         if kind == "plate_any":
             for s in self._counters(core):
                 it = core.counter[s]
@@ -463,10 +531,17 @@ class RulePolicy:
             allowed = expected if isinstance(expected, tuple) else (expected,)
             if now[0] not in allowed:
                 return None
+        if task.step[0] == "park_plate":
+            plan.plate_counter = s
         return s + 1
 
     @staticmethod
-    def _post_ok(core, a, post) -> bool:
+    def _post_ok(core, a, post, plan=None) -> bool:
+        if post[0] == "parked_has":
+            if plan is None or plan.plate_counter is None:
+                return False
+            it = core.counter[plan.plate_counter]
+            return it is not None and it.kind == "plate" and post[1] in it.contents
         h = core.holding[a]
         if post[0] == "empty":
             return h is None
@@ -482,7 +557,7 @@ class RulePolicy:
         """Did the action we issued actually do what the step promised?"""
         task, plan, i = self.pending[a]
         self.pending[a] = None
-        if self._post_ok(core, a, task.steps[i][3]):
+        if self._post_ok(core, a, task.steps[i][3], plan):
             task.i = i + 1
             task.waited = 0
             if task.done:
@@ -580,9 +655,18 @@ class RulePolicy:
         return True
 
     def _claimable(self, core, a, plan, task) -> bool:
-        return (task is not None and not task.done and task.agent is None
-                and all(t.done for t in task.blocked_by)
-                and self._can_do(core, a, task, plan))
+        if task is None or task.done or task.agent is not None:
+            return False
+        for dep in task.blocked_by:
+            if dep.done:
+                continue
+            # In a park plan the plate only has to be on the counter by the time the
+            # component arrives, so the preps may start as soon as somebody is parking
+            # it instead of waiting for that agent to finish.
+            if plan is not None and plan.mode == "park" and dep.agent is not None:
+                continue
+            return False
+        return self._can_do(core, a, task, plan)
 
     def _pick_task(self, core, a):
         # 1. a finished cooker outranks everything (it burns), and an almost finished
@@ -633,6 +717,21 @@ class RulePolicy:
 
     def _skip_satisfied_preps(self, core, plan):
         """Mark prep tasks done when the component is already on a counter / in the cooker."""
+        if plan.mode == "park":
+            if plan.plate_counter is None:
+                return
+            it = core.counter[plan.plate_counter]
+            if it is None or it.kind != "plate":
+                return
+            on_plate = Counter(it.contents)
+            for task in plan.prep:
+                if task.done or task.agent is not None or task is plan.assemble:
+                    continue
+                comp = self._task_comp(task)
+                if comp is not None and on_plate[comp] > 0:
+                    on_plate[comp] -= 1
+                    task.i = len(task.steps)
+            return
         on_counter = Counter()
         for s in self._counters(core):
             it = core.counter[s]
