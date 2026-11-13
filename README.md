@@ -29,6 +29,50 @@ python scripts/generate_orders.py --config configs/env/medium.yaml --seeds 0 1 2
 python scripts/run_random.py --config configs/env/easy.yaml --out results/logs/random_easy
 ```
 
+## Baselines
+
+```bash
+# both baselines, 20 seeds x 3 difficulties -> results/csv/
+python scripts/baselines.py --policy both --config configs/env/easy.yaml \
+    configs/env/medium.yaml configs/env/hard.yaml --seeds 0-19
+
+# one agent only, as a reference for what cooperation adds (open kitchen)
+python scripts/baselines.py --policy rule --config configs/env/medium.yaml --seeds 0-19 --solo
+
+# difficulty experiments: parameters are overridden at run time, configs/env stays untouched
+python scripts/baselines.py --policy rule --config configs/env/medium.yaml --seeds 0-19 \
+    --arrival-scale 0.7 --override burn_after=12
+
+# theoretical capacity of each difficulty (how many dishes 300 steps can serve at best)
+python scripts/capacity.py --config configs/env/easy.yaml configs/env/medium.yaml configs/env/hard.yaml
+```
+
+Writes one row per episode (`baselines_random.csv`, `baselines_rule.csv`) plus a long-format
+summary (`baselines_summary.csv`: config / policy / metric / mean / std). The rule policy is a
+recipe scheduler: it turns a dish into a chain of station visits, keeps two dishes in flight,
+hands the chains out to the two agents, and - when the dish needs no cooker - parks a plate on a
+counter and carries the components straight onto it. See [docs/baselines.md](docs/baselines.md)
+for the method, the numbers and the difficulty calibration.
+
+Seeds 0-19:
+
+| | easy | medium | hard |
+|---|---|---|---|
+| orders completed (random / rule) | 0.00 / 3.65 | 0.10 / 5.10 | 0.00 / 1.40 |
+| orders arrived | 7.20 | 13.45 | 18.20 |
+| dishes ordered | 8.60 | 17.55 | 29.20 |
+| dishes served (rule) | 4.75 | 7.25 | 3.00 |
+| revenue (rule) | 70.7 | 114.9 | 43.6 |
+| avg tip rate (rule) | 0.174 | 0.128 | 0.072 |
+| wasted / burnt (rule) | 0.00 / 0.25 | 0.15 / 0.35 | 2.45 / 0.80 |
+
+The random policy completes about 0 orders everywhere, so the environment is not solvable by
+chance. `scripts/capacity.py` puts the best possible pace at about 16.9 wall steps per dish
+(17.8 dishes in 300 steps): easy then demands 47% of that capacity, medium 99% and hard 172%.
+Medium is therefore designed right at the limit - only a near-optimal policy keeps up - and hard
+is overloaded on purpose. The rule policy runs at 41 steps per dish (about 2.4x the bound), so it
+is a lower reference, not an upper bound.
+
 ## Project structure
 
 ```
@@ -47,6 +91,8 @@ data/
     └── split.json       # split kitchen
 configs/env/             # easy / medium / hard
 scripts/
+├── baselines.py         # random and rule-based baselines (evaluation + CSV)
+├── capacity.py          # theoretical capacity of a difficulty (lower bound)
 ├── generate_orders.py   # generate order CSV files
 └── run_random.py        # run a random episode and save the logs
 tests/test_core.py       # rule tests
