@@ -6,10 +6,47 @@ Two agents, a **chef** and an **assistant**, share one kitchen and work together
 
 ```bash
 pip install -r requirements.txt
-pytest                # should report 32 passed
+pytest                # should report 34 passed
 ```
 
 ## Quick start
+
+### Centralized training
+
+Install the training dependencies with `pip install -r requirements-train.txt`.
+Both algorithms control the chef and assistant jointly. Their hyperparameters are in
+`configs/algo/maskppo.yaml` and `configs/algo/ddqn.yaml`.
+
+```bash
+python scripts/train_centralized.py --config configs/env/medium.yaml --seed 0
+python scripts/train_ddqn.py --config configs/env/medium.yaml --seed 0
+```
+
+`--timesteps N` overrides the configured training length for a quick run.
+The best model by mean reward on fixed evaluation seeds is saved as
+`models/{algorithm}_{config}_seed{seed}.zip` for MaskablePPO or `.pt` for
+Double DQN. Both scripts call the same `evaluate()` function and save one row
+per evaluation seed to `results/csv/{algorithm}_{config}.csv`. Training curves
+go to `runs/`, which Git ignores. MaskablePPO logs TensorBoard events; Double
+DQN writes `curve.csv`. Compare models using the same evaluation seeds and
+`total_reward` or `orders_completed` columns.
+
+Double DQN flattens the two actions into `a0 * 20 + a1`, masks illegal pairs,
+and excludes selecting the same station for both agents. MaskablePPO uses the
+environment's existing per-agent masks, so simultaneous station conflicts can
+still occur. Both scripts keep the highest scoring checkpoint, which is then
+used for the final CSV rows.
+
+The first medium-config run (training seed 0, 500,000 configured steps) selected
+these checkpoints using evaluation seeds 1000-1004:
+
+| Algorithm | Mean reward | Mean orders completed / arrived | Mean revenue |
+|---|---:|---:|---:|
+| MaskablePPO | 15.84 | 6.6 / 12.6 | 132.01 |
+| Double DQN | 3.88 | 2.8 / 12.6 | 73.76 |
+
+These seeds were used to select checkpoints, so a separate held-out seed set is
+needed for an unbiased final comparison. Per-seed scores are in `results/csv/`.
 
 ```python
 from restaurant_env import CentralizedKitchenEnv
