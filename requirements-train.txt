@@ -1,0 +1,5 @@
+-r requirements.txt
+torch>=2.5
+stable-baselines3>=2.4
+sb3-contrib>=2.4
+tensorboard>=2.18
